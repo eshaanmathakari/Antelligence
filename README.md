@@ -3,7 +3,7 @@
 ## 🎯 Hackathon Submission for Launch IO 2025
 **Track**: Competitive Track - Autonomous Agents in the Real World  
 **Theme**: Multi-Agent Swarm Intelligence with IO Intelligence API Integration
-
+**Teammates**: Kashyap Nadendla, Tanya Evita George, Zenith Mesa, Eshaan Mathakari
 ---
 
 ## 🚀 Quick Start
