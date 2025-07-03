@@ -418,10 +418,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact & Support
 
-- **Project Repository**: [GitHub Link]
+- **Project Repository**: [[GitHub Link](https://github.com/eshaanmathakari/mml)]
 - **Demo Video**: [YouTube Link]
-- **Documentation**: [Documentation Site]
-- **Contact**: [email@example.com]
 
 ---
 
