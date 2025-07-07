@@ -79,9 +79,8 @@ class SimpleAntAgent:
             new_position = guided_pos
         elif self.is_llm_controlled and self.model.io_client:
             try:
-                # Access prompt_style and selected_model from Streamlit session state or global scope
-                # In this structure, they are global, defined in sidebar
-                action = self.ask_io_for_decision(st.session_state.get('prompt_style', 'Adaptive'), st.session_state.get('selected_model', 'meta-llama/Llama-3.3-70B-Instruct'))
+                # Pass prompt_style and selected_model from the model's attributes
+                action = self.ask_io_for_decision(self.model.prompt_style, self.model.selected_model)
                 self.api_calls += 1
                 if action == "toward" and possible_steps:
                     # Move to adjacent cell with food if possible or just closer
@@ -207,7 +206,8 @@ class SimpleAntAgent:
 
 class SimpleForagingModel:
     def __init__(self, width, height, N_ants, N_food,
-                 agent_type="LLM-Powered", with_queen=False, use_llm_queen=False):
+                 agent_type="LLM-Powered", with_queen=False, use_llm_queen=False,
+                 selected_model_param="meta-llama/Llama-3.3-70B-Instruct", prompt_style_param="Adaptive"):
         self.width = width
         self.height = height
         # Ensure foods are unique
@@ -228,6 +228,8 @@ class SimpleForagingModel:
         }
         self.with_queen = with_queen
         self.use_llm_queen = use_llm_queen
+        self.selected_model = selected_model_param # Store in model for ant/queen to access
+        self.prompt_style = prompt_style_param # Store in model for ant to access
 
         # Initialize IO client
         if IO_API_KEY:
@@ -257,7 +259,7 @@ class SimpleForagingModel:
         guidance = {}
         if self.queen:
             # Pass selected_model to queen.guide()
-            guidance = self.queen.guide(st.session_state.get('selected_model', 'meta-llama/Llama-3.3-70B-Instruct'))
+            guidance = self.queen.guide(self.selected_model)
 
         self.metrics["ants_carrying_food"] = 0 # Reset for current step
         for ant in self.ants:
@@ -469,7 +471,7 @@ st.session_state['max_steps'] = max_steps
 
 
 # Helper function for comparison simulation
-def run_comparison_simulation(params, num_steps_for_comparison=500):
+def run_comparison_simulation(params, num_steps_for_comparison=100): # Reduced steps
     """Runs a simulation for comparison purposes and returns food collected."""
     # Ensure random seed for reproducibility in comparison
     np.random.seed(42)
@@ -482,7 +484,9 @@ def run_comparison_simulation(params, num_steps_for_comparison=500):
         N_food=params['n_food'],
         agent_type=params['agent_type'],
         with_queen=params['with_queen'],
-        use_llm_queen=params['use_llm_queen']
+        use_llm_queen=params['use_llm_queen'],
+        selected_model_param=params['selected_model'], # Pass selected_model
+        prompt_style_param=params['prompt_style'] # Pass prompt_style
     )
 
     for _ in range(num_steps_for_comparison):
@@ -509,7 +513,8 @@ def main():
                 st.session_state.current_step = 0
                 # Re-initialize model to apply new parameters from sidebar
                 st.session_state.model = SimpleForagingModel(
-                    grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen
+                    grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
+                    selected_model, prompt_style # Pass these directly
                 )
                 st.session_state.compare_results = None # Clear comparison results
 
@@ -559,7 +564,8 @@ def main():
     # Create model if not exists (for initial load)
     if 'model' not in st.session_state:
         st.session_state.model = SimpleForagingModel(
-            grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen
+            grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
+            selected_model, prompt_style # Pass these directly
         )
 
     model = st.session_state.model
@@ -678,7 +684,9 @@ def main():
                 'n_food': n_food,
                 'agent_type': agent_type,
                 'with_queen': False,
-                'use_llm_queen': False # Irrelevant if no queen
+                'use_llm_queen': False, # Irrelevant if no queen
+                'selected_model': selected_model, # Pass selected_model
+                'prompt_style': prompt_style # Pass prompt_style
             }
             food_no_queen = run_comparison_simulation(no_queen_params)
 
@@ -690,7 +698,9 @@ def main():
                 'n_food': n_food,
                 'agent_type': agent_type,
                 'with_queen': True,
-                'use_llm_queen': use_llm_queen # Use the user's selected LLM queen setting
+                'use_llm_queen': use_llm_queen, # Use the user's selected LLM queen setting
+                'selected_model': selected_model, # Pass selected_model
+                'prompt_style': prompt_style # Pass prompt_style
             }
             food_with_queen = run_comparison_simulation(with_queen_params)
 
@@ -702,7 +712,7 @@ def main():
 
 
     if 'compare_results' in st.session_state and st.session_state.compare_results is not None:
-        st.write("### Comparison Results (Food Collected in 500 Steps):")
+        st.write("### Comparison Results (Food Collected in 100 Steps):") # Updated text
         results_df = pd.DataFrame({
             'Scenario': list(st.session_state.compare_results.keys()),
             'Food Collected': list(st.session_state.compare_results.values())
@@ -728,7 +738,7 @@ def main():
         - Prompt Style: {prompt_style}
         - Queen Overseer: {'Enabled' if use_queen else 'Disabled'} ({'LLM-Powered' if use_llm_queen and use_queen else 'Heuristic' if use_queen else 'N/A'})
         - Max Steps (Live Sim): {max_steps}
-        - Comparison Steps: 500
+        - Comparison Steps: 100
 
         **Current Status (Live Sim):**
         - Step: {model.step_count}/{max_steps}
