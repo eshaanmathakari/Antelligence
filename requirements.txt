@@ -8,3 +8,4 @@ openai
 imageio
 imageio-ffmpeg
 pandas
+io-intelligence>=0.3.0

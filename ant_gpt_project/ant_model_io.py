@@ -1,312 +1,199 @@
-import os
-from dotenv import load_dotenv
-import openai
-import matplotlib
-matplotlib.use('Agg')  # Use Agg backend for file output
-import matplotlib.pyplot as plt
-import numpy as np
-from random import choice, random
-import json # for queen ant if used here
+"""
+ant_model_io.py  –  MVP version for SBP-BRiMS Challenge 2
+Only the Queen agent uses the LLM; worker ants remain light-weight.
+"""
 
-# Load API key from .env
+import os, json, random
+from random import choice, random as rand_float
+from dotenv import load_dotenv
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import openai                         # already in your requirements
+
+from queen_llm_agent import plan_moves   # <-- NEW import
+
+# ---------------------------------------------------------------------
+# 0.  ENV & global helpers
+# ---------------------------------------------------------------------
 load_dotenv()
 IO_API_KEY = os.getenv("IO_SECRET_KEY")
 
 def _step_toward(start, target, model):
-    x, y = start
+    x, y   = start
     tx, ty = target
-    # Ensure all neighbors are valid (within bounds)
-    valid_neighbors = model.get_neighborhood(x,y) + [start] # Include current position as an option
-    return min(valid_neighbors, key=lambda n: abs(n[0]-tx)+abs(n[1]-ty))
+    return min(model.get_neighborhood(x, y) + [start],
+               key=lambda n: abs(n[0]-tx) + abs(n[1]-ty))
 
-
-def ask_io_for_ant_decision(ant, model, io_client, selected_model_name):
+# ---------------------------------------------------------------------
+# 1.  Worker-ant behaviour (unchanged except tiny refactor)
+# ---------------------------------------------------------------------
+def ask_io_for_ant_decision(ant, model, io_client, selected_model):
     """
-    Query the IO Intelligence API to decide the ant's next move.
-    Returns: 'toward', 'random', or 'stay'
+    Query IO Intelligence LLM for one-word action: toward | random | stay.
     """
     x, y = ant.pos
-    # Check if food is in the Moore neighborhood
-    food_nearby = any(
-        abs(fx - x) <= 1 and abs(fy - y) <= 1
-        for fx, fy in model.get_food_positions()
-    )
-    carrying = ant.carrying_food
-
+    food_nearby = any(abs(fx-x) <= 1 and abs(fy-y) <= 1
+                      for fx, fy in model.foods)
     user_prompt = (
-        f"You are an ant at position {ant.pos} on a {model.width}x{model.height} grid. "
-        f"Food nearby: {food_nearby}. Carrying food: {carrying}. "
-        "Should you move toward food, move randomly, or stay? "
-        "Reply with 'toward', 'random', or 'stay'."
+        f"You are an ant at {ant.pos} on a {model.width}×{model.height} grid. "
+        f"Food nearby: {food_nearby}. Carrying: {ant.carrying}. "
+        "Reply with one word: toward, random, or stay."
     )
-
     try:
-        response = io_client.chat.completions.create(
-            model=selected_model_name,  # Use the passed model name
+        reply = io_client.chat.completions.create(
+            model=selected_model,
             messages=[
-                {"role": "system", "content": "You are an ant foraging for food. Reply with one word: toward, random, or stay."},
+                {"role": "system",
+                 "content": "Respond ONLY with toward, random, or stay."},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,
-            stream=False,
-            max_completion_tokens=10
+            max_completion_tokens=5,
         )
-        action = response.choices[0].message.content.strip().lower()
-        return action if action in ["toward", "random", "stay"] else "random"
-    except Exception as e:
-        print(f"API call failed for ant {ant.unique_id}: {str(e)}. Falling back to random.")
+        word = reply.choices[0].message.content.strip().lower()
+        return word if word in ("toward", "random", "stay") else "random"
+    except Exception:
         return "random"
 
+# ---------------------------------------------------------------------
+# 2.  Core agents
+# ---------------------------------------------------------------------
+class AntAgent:
+    def __init__(self, uid, model):
+        self.unique_id   = uid
+        self.model       = model
+        self.carrying    = False
+        self.pos         = (np.random.randint(model.width),
+                            np.random.randint(model.height))
+
+    # ----------------------------------------------------------
+    def step(self, guided_pos=None):
+        new_pos = self.pos
+        neigh   = self.model.get_neighborhood(*self.pos)
+
+        if guided_pos:                          # obey Queen
+            new_pos = guided_pos
+        else:                                   # self decision
+            act = ask_io_for_ant_decision(self, self.model,
+                                          self.model.io_client,
+                                          self.model.selected_model)
+            if act == "toward":
+                target = self._nearest_food()
+                new_pos = _step_toward(self.pos, target, self.model) \
+                          if target else choice(neigh)
+            elif act == "random":
+                new_pos = choice(neigh)
+            # else "stay" keeps current
+
+        self.pos = new_pos
+
+        # food pick-up / drop
+        if self.model.is_food_at(self.pos) and not self.carrying:
+            self.carrying = True
+            self.model.remove_food(self.pos)
+        elif self.carrying and rand_float() < 0.05:
+            self.carrying = False
+            self.model.place_food(self.pos)
+
+    def _nearest_food(self):
+        if not self.model.foods: return None
+        return min(self.model.foods,
+                   key=lambda f: abs(f[0]-self.pos[0]) + abs(f[1]-self.pos[1]))
+
+# ----------------------------------------------------------
+class QueenAnt:
+    """
+    Single LLM-driven planner for the colony.
+    """
+    def __init__(self, model, use_llm=True):
+        self.model   = model
+        self.use_llm = use_llm
+
+    def guide(self):
+        if not self.model.foods:
+            return {}
+        return self._guide_with_llm() if self.use_llm else self._guide_heuristic()
+
+    # ----- heuristic fallback (same as before) ----------------
+    def _guide_heuristic(self):
+        guide = {}
+        for ant in self.model.ants:
+            tgt = min(self.model.foods,
+                      key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1]))
+            guide[ant] = _step_toward(ant.pos, tgt, self.model)
+        return guide
+
+    # ----- NEW: delegate to plan_moves ------------------------
+    def _guide_with_llm(self):
+        ants_state = [{"id": a.unique_id,
+                       "position": list(a.pos),
+                       "carrying_food": a.carrying}
+                      for a in self.model.ants]
+        state = {
+            "ants": ants_state,
+            "food": [list(p) for p in self.model.foods],
+            "size": [self.model.width, self.model.height],
+        }
+        moves = plan_moves(state, self.model.io_client, self.model.selected_model)
+        guide = {}
+        for ant in self.model.ants:
+            tgt = moves.get(ant.unique_id)
+            if tgt and tgt in self.model.get_neighborhood(*ant.pos) + [ant.pos]:
+                guide[ant] = tgt
+        return guide
+
+# ---------------------------------------------------------------------
+# 3.  Foraging model
+# ---------------------------------------------------------------------
 class ForagingModel:
-    def __init__(self, width, height, N_ants, N_food, use_queen=False, use_llm_queen=False):
-        self.width = width
-        self.height = height
+    def __init__(self, width, height, N_ants, N_food,
+                 use_queen=True, queen_uses_llm=True):
+        self.width, self.height = width, height
+        # unique food positions
         self.foods = []
         while len(self.foods) < N_food:
-            new_food_pos = (np.random.randint(width), np.random.randint(height))
-            if new_food_pos not in self.foods:
-                self.foods.append(new_food_pos)
+            pos = (np.random.randint(width), np.random.randint(height))
+            if pos not in self.foods:
+                self.foods.append(pos)
 
+        # IO client
         self.io_client = openai.OpenAI(
             api_key=IO_API_KEY,
             base_url="https://api.intelligence.io.solutions/api/v1/"
         ) if IO_API_KEY else None
-        self.selected_model = "meta-llama/Llama-3.3-70B-Instruct" # Default model
+        self.selected_model = "meta-llama/Llama-3.3-70B-Instruct"
 
-        self.ants = [AntAgent(i, self) for i in range(N_ants)]
-        self.queen = QueenAnt(self, use_llm=use_llm_queen) if use_queen else None
+        # agents
+        self.ants  = [AntAgent(i, self) for i in range(N_ants)]
+        self.queen = QueenAnt(self, use_llm=queen_uses_llm) if use_queen else None
 
+    # ----------------------------------------------------------
     def step(self):
-        guidance = {}
-        if self.queen:
-            guidance = self.queen.guide()
-
+        guidance = self.queen.guide() if self.queen else {}
         for ant in self.ants:
-            # Pass the suggested cell (or None)
             ant.step(guidance.get(ant))
 
+    # --- utility helpers ------------------------------
     def get_neighborhood(self, x, y):
         neigh = [(x+dx, y+dy)
-                 for dx in (-1,0,1)
-                 for dy in (-1,0,1)
-                 if (dx,dy)!=(0,0)]
-        valid_neigh = []
-        for i,j in neigh:
-            if 0 <= i < self.width and 0 <= j < self.height and (i,j) not in valid_neigh:
-                valid_neigh.append((i,j))
-        return valid_neigh
+                 for dx in (-1,0,1) for dy in (-1,0,1) if (dx, dy) != (0,0)]
+        return [(i, j) for i, j in neigh
+                if 0 <= i < self.width and 0 <= j < self.height]
 
-    def is_food_at(self, pos):
-        return pos in self.foods
+    def is_food_at(self, pos):     return pos in self.foods
+    def remove_food(self, pos):    self.foods.remove(pos)
+    def place_food(self, pos):     self.foods.append(pos)
 
-    def remove_food(self, pos):
-        if pos in self.foods:
-            self.foods.remove(pos)
-
-    def place_food(self, pos):
-        if pos not in self.foods:
-            self.foods.append(pos)
-
-    def get_agent_positions(self):
-        return [ant.pos for ant in self.ants]
-
-    def get_food_positions(self):
-        return self.foods
-
-class AntAgent:
-    def __init__(self, unique_id, model):
-        self.unique_id = unique_id
-        self.model = model
-        self.carrying_food = False
-        self.pos = (np.random.randint(model.width), np.random.randint(model.height))
-
-    def step(self, guided_pos=None):
-        x, y = self.pos
-        possible_steps = self.model.get_neighborhood(x, y)
-        new_position = self.pos
-
-        if guided_pos:
-            new_position = guided_pos
-        else:
-            action = ask_io_for_ant_decision(self, self.model, self.model.io_client, self.model.selected_model)
-
-            if action == "toward":
-                # Move toward nearest food
-                target_food = self._find_nearest_food()
-                if target_food:
-                    new_position = _step_toward(self.pos, target_food, self.model)
-                else:
-                    new_position = choice(possible_steps) if possible_steps else self.pos
-            elif action == "random":
-                new_position = choice(possible_steps) if possible_steps else self.pos
-            elif action == "stay":
-                new_position = self.pos
-            else:
-                new_position = choice(possible_steps) if possible_steps else self.pos # fallback
-
-        self.pos = new_position
-
-        # Pickup food if available
-        if self.model.is_food_at(self.pos) and not self.carrying_food:
-            self.carrying_food = True
-            self.model.remove_food(self.pos)
-
-        # Drop food randomly after carrying for a while
-        if self.carrying_food and random() < 0.05:
-            self.carrying_food = False
-            self.model.place_food(self.pos)
-
-    def _find_nearest_food(self):
-        if not self.model.foods:
-            return None
-        return min(self.model.foods,
-                   key=lambda f: abs(f[0]-self.pos[0]) + abs(f[1]-self.pos[1]))
-
-
-# ---------------- Queen agent (for ant_model_io.py) ---------------- #
-class QueenAnt:
-    def __init__(self, model, use_llm=False):
-        self.model = model
-        self.use_llm = use_llm
-
-    def guide(self) -> dict:
-        guidance = {}
-        if not self.model.foods:
-            return guidance
-
-        if self.use_llm and self.model.io_client:
-            return self._guide_with_llm()
-        else:
-            return self._guide_with_heuristic()
-
-    def _guide_with_heuristic(self) -> dict:
-        guidance = {}
-        ants = self.model.ants
-        foods = self.model.foods
-        for ant in ants:
-            target = min(foods, key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1]))
-            best_step = _step_toward(ant.pos, target, self.model)
-            guidance[ant] = best_step
-        return guidance
-
-    def _guide_with_llm(self) -> dict:
-        guidance = {}
-        ant_data = []
-        for i, ant in enumerate(self.model.ants):
-            ant_data.append({
-                "id": ant.unique_id,
-                "position": list(ant.pos),
-                "carrying_food": ant.carrying_food
-            })
-
-        state = {
-            "ants": ant_data,
-            "food_positions": [list(p) for p in self.model.foods],
-            "grid_size": [self.model.width, self.model.height]
-        }
-
-        system_prompt = (
-            "You are a hyper-intelligent Queen Ant. Your goal is to optimize food collection for your colony. "
-            "Given the current state of ants and food, you need to provide a single best next step for each ant. "
-            "For each ant, select one adjacent cell (including diagonals) or its current cell. "
-            "Output a JSON object where keys are ant IDs and values are their chosen new [x, y] coordinates. "
-            "Example: {\"0\": [5,6], \"1\": [10,12]}"
-        )
-        user_prompt = f"Current state: {json.dumps(state)}"
-
-        try:
-            response = self.model.io_client.chat.completions.create(
-                model=self.model.selected_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.2,
-                max_completion_tokens=500
-            )
-            llm_response_content = response.choices[0].message.content.strip()
-            moves = json.loads(llm_response_content)
-
-            for ant_id_str, cell in moves.items():
-                ant_id = int(ant_id_str)
-                ant_obj = next((ant for ant in self.model.ants if ant.unique_id == ant_id), None)
-                if ant_obj and isinstance(cell, list) and len(cell) == 2:
-                    proposed_pos = tuple(cell)
-                    valid_moves = self.model.get_neighborhood(*ant_obj.pos) + [ant_obj.pos]
-                    if proposed_pos in valid_moves:
-                        guidance[ant_obj] = proposed_pos
-        except json.JSONDecodeError as e:
-            print(f"Queen LLM response was not valid JSON: {e}. Response: {llm_response_content}. Falling back to heuristic guidance.")
-            guidance = self._guide_with_heuristic()
-        except Exception as e:
-            print(f"An unexpected error occurred with Queen LLM: {e}. Falling back to heuristic guidance.")
-            guidance = self._guide_with_heuristic()
-
-        return guidance
-
-
-def plot_grid(model, step):
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_xlim(-1, model.width)
-    ax.set_ylim(-1, model.height)
-
-    # Plot food (green squares)
-    food_x = [pos[0] for pos in model.foods]
-    food_y = [pos[1] for pos in model.foods]
-    ax.plot(food_x, food_y, 's', color='green', markersize=8, label='Food')
-
-    # Plot ants (blue circles if not carrying, red if carrying)
-    ant_x = [ant.pos[0] for ant in model.ants]
-    ant_y = [ant.pos[1] for ant in model.ants]
-    ant_colors = ['red' if ant.carrying_food else 'blue' for ant in model.ants]
-
-    for i in range(len(ant_x)):
-        ax.plot(ant_x[i], ant_y[i], 'o', color=ant_colors[i], markersize=10, alpha=0.8)
-
-    ax.set_title(f'Ant Foraging Simulation - Step {step}')
-    ax.set_xlabel('X Position')
-    ax.set_ylabel('Y Position')
-    plt.grid(True)
-    
-    # Save plot instead of showing
-    plt.savefig(f'ant_simulation_step_{step}.png', dpi=150, bbox_inches='tight')
-    plt.close()  # Close the figure to free memory
-
-# Run the model and plot the grid
+# ---------------------------------------------------------------------
+# 4.  Quick CLI test
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # Ensure IO_API_KEY is loaded from .env for standalone execution
-    if not IO_API_KEY:
-        print("IO_SECRET_KEY not found in .env file. Please set it up.")
-        exit()
-
-    # Set a random seed for reproducibility
-    random.seed(42)
-    np.random.seed(42)
-
-    print("Running simulation with LLM-powered ants and Queen...")
-    model_llm_queen = ForagingModel(width=20, height=20, N_ants=10, N_food=20, use_queen=True, use_llm_queen=True)
-    for step in range(10):
-        print(f"LLM Queen Sim - Step {step+1}, Food left: {len(model_llm_queen.foods)}")
-        model_llm_queen.step()
-        plot_grid(model_llm_queen, f"llm_queen_step_{step}")
-    print(f"LLM Queen Simulation completed! Food left: {len(model_llm_queen.foods)}")
-
-
-    print("\nRunning simulation with heuristic Queen...")
-    model_heuristic_queen = ForagingModel(width=20, height=20, N_ants=10, N_food=20, use_queen=True, use_llm_queen=False)
-    for step in range(10):
-        print(f"Heuristic Queen Sim - Step {step+1}, Food left: {len(model_heuristic_queen.foods)}")
-        model_heuristic_queen.step()
-        plot_grid(model_heuristic_queen, f"heuristic_queen_step_{step}")
-    print(f"Heuristic Queen Simulation completed! Food left: {len(model_heuristic_queen.foods)}")
-
-
-    print("\nRunning simulation without Queen (random movement)...")
-    model_no_queen = ForagingModel(width=20, height=20, N_ants=10, N_food=20, use_queen=False)
-    for step in range(10):
-        print(f"No Queen Sim - Step {step+1}, Food left: {len(model_no_queen.foods)}")
-        model_no_queen.step()
-        plot_grid(model_no_queen, f"no_queen_step_{step}")
-    print(f"No Queen Simulation completed! Food left: {len(model_no_queen.foods)}")
-
-    print("\nAll simulations completed! Check the generated PNG files.")
+    random.seed(42); np.random.seed(42)
+    model = ForagingModel(20, 20, 10, 20, use_queen=True, queen_uses_llm=True)
+    for step in range(15):
+        model.step()
+        print(f"step={step:02d}  remaining_food={len(model.foods)}")
