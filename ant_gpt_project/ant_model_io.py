@@ -112,11 +112,18 @@ class QueenAnt:
     def __init__(self, model, use_llm=True):
         self.model   = model
         self.use_llm = use_llm
+        self.step_counter = 0
 
     def guide(self):
-        if not self.model.foods:
-            return {}
-        return self._guide_with_llm() if self.use_llm else self._guide_heuristic()
+        self.step_counter += 1
+        if self.step_counter % 5 == 0:
+            return self._global_scan_strategy()
+        else:
+            return self._guide_with_llm() if self.use_llm else self._guide_heuristic()
+
+        # if not self.model.foods:
+        #     return {}
+        # return self._guide_with_llm() if self.use_llm else self._guide_heuristic()
 
     # ----- heuristic fallback (same as before) ----------------
     def _guide_heuristic(self):
@@ -145,6 +152,21 @@ class QueenAnt:
             if tgt and tgt in self.model.get_neighborhood(*ant.pos) + [ant.pos]:
                 guide[ant] = tgt
         return guide
+    
+    def _global_scan_strategy(self):
+        """
+        Every 5 steps, Queen does a global scan: for each ant, assign
+        a move toward the nearest piece of food on the entire grid.
+        """
+        guide = {}
+        for ant in self.model.ants:
+            if not self.model.foods:
+                continue
+            tgt = min(self.model.foods,
+                      key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1]))
+            guide[ant] = _step_toward(ant.pos, tgt, self.model)
+        return guide
+
 
 # ---------------------------------------------------------------------
 # 3.  Foraging model
