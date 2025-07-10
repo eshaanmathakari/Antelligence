@@ -310,7 +310,7 @@ class QueenAnt:
         self.model = model
         self.use_llm = use_llm
 
-    def guide(self, selected_model_param) -> dict: # Pass selected_model as parameter
+    def guide(self, selected_model_param) -> dict:
         guidance = {}
         if not self.model.foods:
             return guidance
@@ -325,13 +325,11 @@ class QueenAnt:
         ants = self.model.ants
         foods = self.model.foods
         for ant in ants:
-            # pick nearest food using Manhattan distance
-            if foods: # Ensure there is food to pick
+            if foods:
                 target = min(
                     foods,
                     key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1])
                 )
-                # one-step move that reduces manhattan distance
                 possible_moves = self.model.get_neighborhood(*ant.pos)
                 if possible_moves:
                     best_step = min(
@@ -339,81 +337,87 @@ class QueenAnt:
                         key=lambda n: abs(n[0]-target[0]) + abs(n[1]-target[1])
                     )
                     guidance[ant] = best_step
-                else: # No valid moves, stay put
+                else:
                     guidance[ant] = ant.pos
-            else: # No food, ant stays put
+            else:
                 guidance[ant] = ant.pos
         return guidance
 
-    def _guide_with_llm(self, selected_model_param) -> dict: # Use selected_model_param
+    def _guide_with_llm(self, selected_model_param) -> dict:
         guidance = {}
         if not self.model.io_client:
             st.warning("IO Client not initialized for Queen Ant. Falling back to heuristic guidance.")
             return self._guide_with_heuristic()
 
-        # Prepare state for LLM
-        ant_data = []
-        for i, ant in enumerate(self.model.ants):
-            ant_data.append({
-                "id": ant.unique_id,
-                "position": list(ant.pos),
-                "carrying_food": ant.carrying_food
-            })
-
+        # ✅ Build STATE JSON
         state = {
-            "ants": ant_data,
+            "ants": [
+                {"id": ant.unique_id, "position": list(ant.pos), "carrying_food": ant.carrying_food}
+                for ant in self.model.ants
+            ],
             "food_positions": [list(p) for p in self.model.foods],
             "grid_size": [self.model.width, self.model.height]
         }
 
-        # Prompt for the Queen LLM
-        system_prompt = (
-            "You are a hyper-intelligent Queen Ant. Your goal is to optimize food collection for your colony. "
-            "Given the current state of ants and food, you need to provide a single best next step for each ant. "
-            "For each ant, select one adjacent cell (including diagonals) or its current cell. "
-            "Output a JSON object where keys are ant IDs and values are their chosen new [x, y] coordinates. "
-            "Example: {\"0\": [5,6], \"1\": [10,12]}"
-        )
-        user_prompt = f"Current state: {json.dumps(state)}"
+        # ✅ New explicit system + user prompts
+        system_prompt = """
+You are a hyper-intelligent Queen Ant. 
+Your only job is to output the next move for each ant.
 
-        llm_response_content = "" # Initialize to avoid NameError in except block
-        try:
-            response = self.model.io_client.chat.completions.create(
-                model=selected_model_param, # Using the selected model from sidebar
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.2, # Lower temperature for more deterministic guidance
-                max_completion_tokens=500 # Sufficient tokens for JSON output
-            )
-            llm_response_content = response.choices[0].message.content.strip()
-            moves = json.loads(llm_response_content)
+STRICT RULES:
+- Output ONLY a JSON object mapping ant IDs to positions [x,y].
+- Example: {"0": [1,2], "1": [3,4]}
+- NO explanations, NO text, NO comments, NO markdown.
+- If you cannot comply, output exactly: {"retry": true}
+"""
 
-            for ant_id_str, cell in moves.items():
-                ant_id = int(ant_id_str)
-                # Find the ant object
-                ant_obj = next((ant for ant in self.model.ants if ant.unique_id == ant_id), None)
-                if ant_obj and isinstance(cell, list) and len(cell) == 2:
-                    proposed_pos = tuple(cell)
-                    # Validate if proposed_pos is a valid neighbor or current pos (within bounds)
-                    # This adds robustness against hallucinated coordinates from the LLM
-                    valid_moves = self.model.get_neighborhood(*ant_obj.pos) + [ant_obj.pos]
-                    if proposed_pos in valid_moves:
-                        guidance[ant_obj] = proposed_pos
-                    # If LLM suggests an invalid move, the ant will fall back to its own logic (random/toward)
-                    # No explicit 'else' needed here for invalid moves, as they won't be added to guidance
-        except json.JSONDecodeError as e:
-            st.error(f"Queen LLM response was not valid JSON: {e}. Response: {llm_response_content}. Falling back to heuristic guidance.")
-            guidance = self._guide_with_heuristic()
-        except openai.APICallError as e:
-            st.error(f"Queen LLM API call failed: {e}. Falling back to heuristic guidance.")
-            guidance = self._guide_with_heuristic()
-        except Exception as e:
-            st.error(f"An unexpected error occurred with Queen LLM: {e}. Falling back to heuristic guidance.")
-            guidance = self._guide_with_heuristic()
+        user_prompt = f"""
+Here is the current state of the colony:
 
-        return guidance
+{json.dumps(state)}
+
+Please reply ONLY with the JSON object.
+"""
+
+        llm_response_content = ""
+        # Try up to 3 times to get valid JSON
+        for _ in range(3):
+            try:
+                response = self.model.io_client.chat.completions.create(
+                    model=selected_model_param,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.2,
+                    max_completion_tokens=500
+                )
+                llm_response_content = response.choices[0].message.content.strip()
+                moves = json.loads(llm_response_content)
+
+                if moves.get("retry") is True:
+                    continue
+
+                # Validate moves
+                for ant_id_str, cell in moves.items():
+                    ant_id = int(ant_id_str)
+                    ant_obj = next((ant for ant in self.model.ants if ant.unique_id == ant_id), None)
+                    if ant_obj and isinstance(cell, list) and len(cell) == 2:
+                        proposed_pos = tuple(cell)
+                        valid_moves = self.model.get_neighborhood(*ant_obj.pos) + [ant_obj.pos]
+                        if proposed_pos in valid_moves:
+                            guidance[ant_obj] = proposed_pos
+                return guidance
+
+            except json.JSONDecodeError:
+                continue
+            except Exception:
+                continue
+
+        # If we exhaust retries
+        st.warning(f"Queen LLM failed after retries. Falling back to heuristic. Last raw: {llm_response_content}")
+        return self._guide_with_heuristic()
+
 # --- End Class Definitions ---
 
 
