@@ -239,6 +239,10 @@ class SimpleForagingModel:
             )
         else:
             self.io_client = None
+            
+        # initializing LLM queens report
+        self.queen_llm_anomaly_rep="Queen's report will appear here when queen is active" 
+
 
         # Create agents based on type
         self.ants = []
@@ -345,43 +349,57 @@ class QueenAnt:
 
     def _guide_with_llm(self, selected_model_param) -> dict:
         guidance = {}
+        # initializing default report from Queen 
+        anomaly_report_content = "Queen is evaluating colony status and anomalies..."
+
         if not self.model.io_client:
             st.warning("IO Client not initialized for Queen Ant. Falling back to heuristic guidance.")
+            # ensuring report is available even on fallback
+            self.model.queen_llm_anomaly_rep = anomaly_report_content
             return self._guide_with_heuristic()
 
         # ✅ Build STATE JSON
         state = {
             "ants": [
-                {"id": ant.unique_id, "position": list(ant.pos), "carrying_food": ant.carrying_food}
+                {"id": ant.unique_id, "position": list(ant.pos), "carrying_food": ant.carrying_food, "is_llm_controlled": ant.is_llm_controlled}
                 for ant in self.model.ants
             ],
             "food_positions": [list(p) for p in self.model.foods],
-            "grid_size": [self.model.width, self.model.height]
+            "grid_size": [self.model.width, self.model.height],
+            "currentstep": [self.model.step_count],
+            "total_food_piles": len(self.model.foods), # number of food piles left
+            "food_collected_overall": self.model.metrics["food_collected"],
+            "ants_carrying_food_count": self.model.metrics["ants_carrying_food"]
         }
 
         # ✅ New explicit system + user prompts
         system_prompt = """
-You are a hyper-intelligent Queen Ant. 
-Your only job is to output the next move for each ant.
+You are a hyper-intelligent Queen Ant overseeing a foraging colony.
+Your primary task is to guide worker ants by proposing their next move.
+Additionally, you must provide a concise "anomaly_report" based on the colony's current state and performance.
+Consider factors like ant distribution, food availability, and apparent efficiency.
 
 STRICT RULES:
-- Output ONLY a JSON object mapping ant IDs to positions [x,y].
-- Example: {"0": [1,2], "1": [3,4]}
-- NO explanations, NO text, NO comments, NO markdown.
-- If you cannot comply, output exactly: {"retry": true}
+- Output ONLY a single JSON object.
+- This JSON object MUST have two top-level keys: "guidance" and "anomaly_report".
+- "guidance" must be an object mapping ant IDs (as strings) to their chosen next positions [x,y].
+  Example: {"guidance": {"0": [1,2], "1": [3,4]}, "anomaly_report": "Your observation here."}
+- "anomaly_report" must be a concise string (max 2-3 sentences) with your observation. If everything seems normal, state "No significant anomalies observed."
+- NO explanations, NO text, NO comments, NO markdown outside the JSON.
+- If you cannot comply with the guidance format or any other rule, output exactly: {"retry": true, "anomaly_report": "Queen: Failed to generate valid guidance, attempting retry."}
 """
 
         user_prompt = f"""
-Here is the current state of the colony:
+Here is the current state of the colony at step {self.model.step_count}:
 
 {json.dumps(state)}
 
-Please reply ONLY with the JSON object.
+Based on this information, provide the optimal guidance for each ant, and report any anomalies or key observations about the colony's foraging efficiency or unusual behavior.
 """
 
-        llm_response_content = ""
+        llm_full_response_content = "" # Store the raw LLM response for debugging
         # Try up to 3 times to get valid JSON
-        for _ in range(3):
+        for retry_attempt in range(3):
             try:
                 response = self.model.io_client.chat.completions.create(
                     model=selected_model_param,
@@ -390,32 +408,63 @@ Please reply ONLY with the JSON object.
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.2,
-                    max_completion_tokens=500
+                    max_completion_tokens=600 # Increased to allow for longer report and more ants
                 )
-                llm_response_content = response.choices[0].message.content.strip()
-                moves = json.loads(llm_response_content)
+                llm_full_response_content = response.choices[0].message.content.strip()
+                parsed_response = json.loads(llm_full_response_content)
 
-                if moves.get("retry") is True:
-                    continue
+                # Handle retry signal from LLM or if expected keys are missing
+                if parsed_response.get("retry") is True:
+                    anomaly_report_content = parsed_response.get("anomaly_report", f"Queen: Invalid format (retry signal), retrying. Attempt {retry_attempt + 1}.")
+                    self.model.queen_llm_anomaly_rep = anomaly_report_content # Update report for UI
+                    continue # Retry loop
 
-                # Validate moves
-                for ant_id_str, cell in moves.items():
+                # Extract guidance and report from the valid JSON
+                raw_guidance = parsed_response.get("guidance", {})
+                anomaly_report_content = parsed_response.get("anomaly_report", "Queen: No specific report provided by LLM.")
+
+                # Validate moves and build guidance dictionary
+                valid_guidance_received = False
+                for ant_id_str, cell in raw_guidance.items():
                     ant_id = int(ant_id_str)
                     ant_obj = next((ant for ant in self.model.ants if ant.unique_id == ant_id), None)
                     if ant_obj and isinstance(cell, list) and len(cell) == 2:
                         proposed_pos = tuple(cell)
+                        # Ensure proposed move is within valid neighborhood or current position
                         valid_moves = self.model.get_neighborhood(*ant_obj.pos) + [ant_obj.pos]
                         if proposed_pos in valid_moves:
                             guidance[ant_obj] = proposed_pos
+                            valid_guidance_received = True # At least one valid guidance received
+                        else:
+                            # Log or handle invalid proposed move for specific ant
+                            st.info(f"Queen proposed invalid move for Ant {ant_id}: {proposed_pos}. Falling back to ant's own logic.")
+                    else:
+                         st.info(f"Queen provided malformed guidance for Ant {ant_id_str}: {cell}. Skipping.")
+
+
+                # If LLM response was valid JSON but contained no valid guidance, we should retry or fall back
+                if not raw_guidance and not valid_guidance_received and retry_attempt < 2: # Don't retry if it's the last attempt
+                    anomaly_report_content = "Queen: LLM provided valid JSON but no usable guidance. Retrying."
+                    self.model.queen_llm_anomaly_rep = anomaly_report_content
+                    continue # Retry loop
+
+                # Successfully parsed and (at least partially) validated. Store report and return.
+                self.model.queen_llm_anomaly_rep = anomaly_report_content
                 return guidance
 
             except json.JSONDecodeError:
-                continue
-            except Exception:
-                continue
+                anomaly_report_content = f"Queen: JSON decoding failed. Raw response: '{llm_full_response_content[:200]}...' Retrying. Attempt {retry_attempt + 1}."
+                self.model.queen_llm_anomaly_rep = anomaly_report_content
+                continue # Retry loop
+            except Exception as e:
+                anomaly_report_content = f"Queen: Unexpected error during LLM call or parsing: {e}. Raw: '{llm_full_response_content[:200]}...' Retrying. Attempt {retry_attempt + 1}."
+                self.model.queen_llm_anomaly_rep = anomaly_report_content
+                continue # Retry loop
 
-        # If we exhaust retries
-        st.warning(f"Queen LLM failed after retries. Falling back to heuristic. Last raw: {llm_response_content}")
+        # If all retries are exhausted
+        final_fallback_report = f"Queen LLM failed after {retry_attempt + 1} retries. Falling back to heuristic. Last raw: '{llm_full_response_content[:200]}...'"
+        st.warning(final_fallback_report)
+        self.model.queen_llm_anomaly_rep = final_fallback_report # Ensure report is always set
         return self._guide_with_heuristic()
 
 # --- End Class Definitions ---
@@ -627,6 +676,25 @@ def main():
 
     # Display the plot
     st.plotly_chart(fig, use_container_width=True)
+
+     # --- NEW SECTION FOR QUEEN'S REPORT ---
+    st.subheader("👑 Queen's Anomaly Report")
+    if st.session_state.model.queen and st.session_state.model.use_llm_queen:
+        report = st.session_state.model.queen_llm_anomaly_rep
+        # Dynamic styling based on report content
+        if "Failed" in report or "error" in report or "invalid" in report or "malformed" in report:
+            st.error(report)
+        elif "Warning:" in report or "stuck" in report or "critically low" in report or "unusual behavior" in report:
+            st.warning(report)
+        elif "No significant anomalies" in report or "foraging effectively" in report or "stable" in report:
+            st.info(report)
+        else: # Default for general observations or other states
+            st.write(report)
+    elif st.session_state.model.queen and not st.session_state.model.use_llm_queen:
+        st.info("Queen Overseer is enabled, but not using LLM for reports (Heuristic mode).")
+    else:
+        st.info("Queen Overseer is disabled. Enable in sidebar to see reports.")
+    # --- END NEW SECTION ---
 
     # Simulation execution
     if st.session_state.simulation_running and model.step_count < max_steps:
