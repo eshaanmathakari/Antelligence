@@ -384,6 +384,7 @@ STRICT RULES:
 - This JSON object MUST have two top-level keys: "guidance" and "anomaly_report".
 - "guidance" must be an object mapping ant IDs (as strings) to their chosen next positions [x,y].
   Example: {"guidance": {"0": [1,2], "1": [3,4]}, "anomaly_report": "Your observation here."}
+  **VERY IMPORTANT: For each ant, the proposed next position [x,y] MUST be either the ant's current position OR an adjacent cell (horizontally, vertically, or diagonally). It CANNOT be more than one step away in any direction. All coordinates must be within the grid_size [0, width-1] and [0, height-1].**
 - "anomaly_report" must be a concise string (max 2-3 sentences) with your observation. If everything seems normal, state "No significant anomalies observed."
 - NO explanations, NO text, NO comments, NO markdown outside the JSON.
 - If you cannot comply with the guidance format or any other rule, output exactly: {"retry": true, "anomaly_report": "Queen: Failed to generate valid guidance, attempting retry."}
