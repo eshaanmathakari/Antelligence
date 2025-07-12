@@ -120,12 +120,14 @@ class SimpleAntAgent:
         if self.model.is_food_at(self.pos) and not self.carrying_food:
             # Pick up food
             self.carrying_food = True
-            self.model.remove_food(self.pos)
+            # --- CHANGES ADDED FOR STEP 4 FOR FORAGING EFFICIENCY MAP ---
+            self.model.collect_food(self.pos, self.is_llm_controlled)
             self.food_collected_count += 1
-            if self.is_llm_controlled:
-                self.model.metrics["food_collected_by_llm"] += 1
-            else:
-                self.model.metrics["food_collected_by_rule"] += 1
+            # if self.is_llm_controlled:
+            #    self.model.metrics["food_collected_by_llm"] += 1
+            # else:
+            #    self.model.metrics["food_collected_by_rule"] += 1
+            # --- END OF CHANGES ---
         
         # FIXED: Only drop food at nest/home for rule-based ants, never randomly for LLM ants
         if self.carrying_food and not self.is_llm_controlled:
@@ -237,6 +239,17 @@ class SimpleForagingModel:
         self.food_depletion_history = []
         self.initial_food_count = N_food
 
+
+        # --- FORAGING EFFICIENCY MAP (STEP 1) ---
+        # Initialize the foraging efficiency grid
+        self.foraging_efficiency_grid = np.zeros((self.width, self.height))
+        # Define the decay rate for the grid values
+        self.foraging_decay_rate = 0.98 # Retains 98% of value each step, 2% decays
+        self.food_collection_score_boost = 10.0 # Score boost for collecting food
+        self.traverse_score_boost = 0.1 # Score boost for just traversing a cell
+        # --- END ADDITION ---
+
+
         # Create agents based on type
         self.ants = []
         if agent_type == "LLM-Powered":
@@ -270,6 +283,25 @@ class SimpleForagingModel:
             if ant.is_llm_controlled:
                 self.metrics["total_api_calls"] += ant.api_calls
 
+
+         # --- STEP 2 FOR FORAGING EFFICIENCY MAP ---
+        # 1. Apply decay to the entire grid at the beginning of this update phase
+        self.foraging_efficiency_grid *= self.foraging_decay_rate
+        # Ensure values don't go below zero after decay (optional, but good practice)
+        self.foraging_efficiency_grid[self.foraging_efficiency_grid < 0.01] = 0
+
+        # 2. Iterate through ants to add score for traversing (exploration effort)
+        # We process this after all ants have moved
+        for ant in self.ants:
+            if ant.is_llm_controlled: # Only track LLM ants for this map
+                x, y = ant.pos
+                # Add score for traversing (exploration effort)
+                # Ensure x, y are within bounds before accessing grid
+                if 0 <= x < self.width and 0 <= y < self.height:
+                    self.foraging_efficiency_grid[x, y] += self.traverse_score_boost
+        # --- END ADDITION ---
+
+
         food_piles_remaining = len(self.foods)
         self.food_depletion_history.append({
             "step": self.step_count,
@@ -290,10 +322,25 @@ class SimpleForagingModel:
     def is_food_at(self, pos):
         return pos in self.foods
 
-    def remove_food(self, pos):
+    def collect_food(self, pos, is_llm_controlled_ant):
         if pos in self.foods:
             self.foods.discard(pos)
             self.metrics["food_collected"] += 1
+
+            # --- STEP 3 FOR FORAGING EFFICIENY MAP---
+            # Update specific metrics for LLM vs Rule-Based based on who collected
+            if is_llm_controlled_ant:
+                self.metrics["food_collected_by_llm"] += 1
+            else:
+                self.metrics["food_collected_by_rule"] += 1
+
+            # Only boost the efficiency map if an LLM-controlled ant collected food
+            # Ensure pos (x, y) are within grid bounds
+            x, y = pos
+            if 0 <= x < self.width and 0 <= y < self.height:
+                if is_llm_controlled_ant:
+                    self.foraging_efficiency_grid[x, y] += self.food_collection_score_boost
+            # --- END ADDITION ---
 
     def place_food(self, pos):
         if pos not in self.foods:
@@ -576,6 +623,27 @@ def main():
     st.subheader("🗺️ Live Simulation Visualization")
     fig = go.Figure()
 
+    # --- ADD THESE LINES TO INTEGRATE THE HEATMAP (This is the new "Step 2" for main()) ---
+    # Get the foraging efficiency grid data
+    efficiency_data = st.session_state.model.foraging_efficiency_grid
+
+    # Add the heatmap as the first trace so it's in the background
+    fig.add_trace(go.Heatmap(
+        z=efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
+        x=np.arange(model.width),
+        y=np.arange(model.height),
+        colorscale='YlOrRd', # A good, visible hot-spot color scale
+        colorbar=dict(title='Efficiency Score'),
+        opacity=0.5, # Make it semi-transparent so ants/food are visible
+        hoverinfo='skip', # Don't show hover info for heatmap cells
+        name='LLM Foraging Hotspot', # Name for legend
+        zmin=0, # Minimum value for color scale
+        zmax=np.max(efficiency_data) * 1.2 # Scale max dynamically for visual effect
+    ))
+    # --- END ADDITION ---
+
+
+
     # Add food items
     if model.foods:
         food_x, food_y = zip(*model.foods)
@@ -689,6 +757,28 @@ def main():
                                         title="Food Piles Over Time",
                                         markers=True)
                 st.plotly_chart(fig_depletion, use_container_width=True)
+
+        # --- STEP 5 FOR THE FORAGING EFFICIENCY MAP ---
+        #st.write("### 🌐 Foraging Efficiency Map (LLM Activity)")
+        # Get the grid data
+        #efficiency_data = st.session_state.model.foraging_efficiency_grid
+
+        # Create a heatmap
+        #fig_efficiency = px.imshow(efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
+                                    #color_continuous_scale="Hot", # Use a "hot" color scale
+                                    #labels=dict(x="X Position", y="Y Position", color="Efficiency Score"),
+                                    #title="LLM Foraging Activity Hotspot",
+                                    #origin="lower", # Important for correct Y-axis orientation
+                                    #range_color=[0, np.max(efficiency_data) * 1.2]) # Scale color range dynamically
+
+        # Customize layout for better visualization
+        #fig_efficiency.update_xaxes(side="top", showgrid=False, zeroline=False,
+                                    #tickvals=np.arange(model.width), ticktext=np.arange(model.width))
+        #fig_efficiency.update_yaxes(showgrid=False, zeroline=False,
+                                    #tickvals=np.arange(model.height), ticktext=np.arange(model.height))
+
+        #st.plotly_chart(fig_efficiency, use_container_width=True)
+        # --- END ADDITION ---
 
     # Comparison section
     st.markdown("---")
