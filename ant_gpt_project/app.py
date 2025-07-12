@@ -68,11 +68,20 @@ class SimpleAntAgent:
         self.api_calls = 0
         self.move_history = []
         self.food_collected_count = 0
+        self.steps_since_food = 0 # For recruitment pheromone
 
     def step(self, guided_pos=None):
         x, y = self.pos
         possible_steps = self.model.get_neighborhood(x, y)
         new_position = self.pos
+
+        # Pheromone deposition before moving (based on current state)
+        if self.carrying_food:
+            # Deposit trail pheromone when carrying food (implies returning from food source)
+            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 0.5) # Less intense when returning
+        elif self.model.is_food_at(self.pos):
+            # Deposit trail pheromone when at a food source
+            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5) # More intense at source
 
         if guided_pos and guided_pos in possible_steps + [self.pos]:
             # Queen guidance takes priority
@@ -94,6 +103,8 @@ class SimpleAntAgent:
                 else:
                     new_position = choice(possible_steps) if possible_steps else self.pos
             except Exception as e:
+                # Deposit alarm pheromone on API error
+                self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5) # More intense alarm for API error
                 if possible_steps:
                     new_position = choice(possible_steps)
                 else:
@@ -116,20 +127,22 @@ class SimpleAntAgent:
         self.move_history.append(self.pos)
         self.pos = new_position
 
-        # FIXED: Food pickup/drop logic
+        # Food pickup/drop logic
         if self.model.is_food_at(self.pos) and not self.carrying_food:
             # Pick up food
             self.carrying_food = True
-            # --- CHANGES ADDED FOR STEP 4 FOR FORAGING EFFICIENCY MAP ---
             self.model.collect_food(self.pos, self.is_llm_controlled)
             self.food_collected_count += 1
-            # if self.is_llm_controlled:
-            #    self.model.metrics["food_collected_by_llm"] += 1
-            # else:
-            #    self.model.metrics["food_collected_by_rule"] += 1
-            # --- END OF CHANGES ---
+            self.steps_since_food = 0 # Reset counter
+            # Deposit a strong trail pheromone upon successful food pickup
+            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 2)
+        else:
+            self.steps_since_food += 1
+            # If LLM ant hasn't found food for a while, deposit recruitment pheromone
+            if self.is_llm_controlled and self.steps_since_food > 10 and not self.carrying_food:
+                self.model.deposit_pheromone(self.pos, 'recruitment', self.model.recruitment_deposit)
         
-        # FIXED: Only drop food at nest/home for rule-based ants, never randomly for LLM ants
+        # Only drop food at nest/home for rule-based ants, never randomly for LLM ants
         if self.carrying_food and not self.is_llm_controlled:
             home = (self.model.width // 2, self.model.height // 2)
             # Drop food if at home position or very close to it
@@ -137,6 +150,8 @@ class SimpleAntAgent:
                 if random.random() < 0.3:  # 30% chance to drop at home
                     self.carrying_food = False
                     # Don't place food back on grid when dropping at home
+                    # Deposit trail pheromone at nest when dropping food
+                    self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5)
 
     def _find_nearest_food(self):
         if not self.model.foods:
@@ -158,12 +173,24 @@ class SimpleAntAgent:
             abs(fx - x) <= 2 and abs(fy - y) <= 2
             for fx, fy in self.model.get_food_positions()
         )
+        
+        # Get local pheromone information
+        local_pheromones = self.model.get_local_pheromones(self.pos, radius=2)
+        
+        pheromone_info = (
+            f"Local Pheromones (radius 2): "
+            f"Trail: {local_pheromones['trail']:.2f}, "
+            f"Alarm: {local_pheromones['alarm']:.2f}, "
+            f"Recruitment: {local_pheromones['recruitment']:.2f}. "
+        )
 
         if prompt_style_param == "Structured":
             prompt = (
                 f"You are an ant at position ({x},{y}) on a {self.model.width}x{self.model.height} grid. "
                 f"Food nearby: {food_nearby}. Carrying food: {self.carrying_food}. "
+                f"{pheromone_info}"
                 "Should you move 'toward' food, move 'random', or 'stay'? "
+                "Consider the pheromones: high trail means good path, high alarm means danger, high recruitment means others need help or found something. "
                 "Reply with only one word: 'toward', 'random', or 'stay'."
             )
         elif prompt_style_param == "Autonomous":
@@ -172,7 +199,9 @@ class SimpleAntAgent:
                 f"Position: ({x},{y}), "
                 f"Food available nearby: {food_nearby}, "
                 f"Currently carrying food: {self.carrying_food}. "
-                "What is the best action? Choose: 'toward', 'random', or 'stay'."
+                f"{pheromone_info}"
+                "What is the best action? Choose: 'toward', 'random', or 'stay'. "
+                "Interpret pheromone signals: Strong trail suggests a good path, strong alarm suggests avoiding the area, strong recruitment suggests exploring or assisting."
             )
         else:  # Adaptive
             efficiency = self.food_collected_count
@@ -181,7 +210,9 @@ class SimpleAntAgent:
                 f"Current position: ({x},{y}). "
                 f"Food nearby: {food_nearby}. "
                 f"Carrying food: {self.carrying_food}. "
-                "Best action? Options: 'toward', 'random', 'stay'."
+                f"{pheromone_info}"
+                "Best action? Options: 'toward', 'random', 'stay'. "
+                "Use pheromones to guide your decision: Follow strong trails, avoid alarms, respond to recruitment calls."
             )
 
         try:
@@ -197,6 +228,8 @@ class SimpleAntAgent:
             action = response.choices[0].message.content.strip().lower()
             return action if action in ["toward", "random", "stay"] else "random"
         except Exception as e:
+            # Deposit alarm pheromone on API error
+            self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5) # More intense alarm for API error
             return "random"
 
 class SimpleForagingModel:
@@ -226,6 +259,18 @@ class SimpleForagingModel:
         self.selected_model = selected_model_param
         self.prompt_style = prompt_style_param
 
+        # Pheromone map initialization (from my previous version)
+        self.pheromone_map = {
+            'trail': np.zeros((width, height)),
+            'alarm': np.zeros((width, height)),
+            'recruitment': np.zeros((width, height))
+        }
+        self.pheromone_decay_rate = 0.05 # 5% decay per step
+        self.trail_deposit = 1.0
+        self.alarm_deposit = 2.0
+        self.recruitment_deposit = 1.5
+        self.max_pheromone_value = 10.0 # Upper bound for pheromone values
+
         # Initialize IO client
         if IO_API_KEY:
             self.io_client = openai.OpenAI(
@@ -239,8 +284,7 @@ class SimpleForagingModel:
         self.food_depletion_history = []
         self.initial_food_count = N_food
 
-
-        # --- FORAGING EFFICIENCY MAP (STEP 1) ---
+        # --- FORAGING EFFICIENCY MAP (from teammate's code) ---
         # Initialize the foraging efficiency grid
         self.foraging_efficiency_grid = np.zeros((self.width, self.height))
         # Define the decay rate for the grid values
@@ -284,7 +328,7 @@ class SimpleForagingModel:
                 self.metrics["total_api_calls"] += ant.api_calls
 
 
-         # --- STEP 2 FOR FORAGING EFFICIENCY MAP ---
+        # --- FORAGING EFFICIENCY MAP updates (from teammate's code) ---
         # 1. Apply decay to the entire grid at the beginning of this update phase
         self.foraging_efficiency_grid *= self.foraging_decay_rate
         # Ensure values don't go below zero after decay (optional, but good practice)
@@ -301,6 +345,10 @@ class SimpleForagingModel:
                     self.foraging_efficiency_grid[x, y] += self.traverse_score_boost
         # --- END ADDITION ---
 
+        # Apply pheromone evaporation and clipping after all ants have moved (from my previous version)
+        for p_type in self.pheromone_map:
+            self.pheromone_map[p_type] *= (1 - self.pheromone_decay_rate)
+            self.pheromone_map[p_type] = np.clip(self.pheromone_map[p_type], 0, self.max_pheromone_value)
 
         food_piles_remaining = len(self.foods)
         self.food_depletion_history.append({
@@ -323,11 +371,12 @@ class SimpleForagingModel:
         return pos in self.foods
 
     def collect_food(self, pos, is_llm_controlled_ant):
+        # This method was refactored by your teammate.
+        # It now handles removing food and updating metrics for both LLM and Rule-Based ants.
         if pos in self.foods:
             self.foods.discard(pos)
             self.metrics["food_collected"] += 1
 
-            # --- STEP 3 FOR FORAGING EFFICIENY MAP---
             # Update specific metrics for LLM vs Rule-Based based on who collected
             if is_llm_controlled_ant:
                 self.metrics["food_collected_by_llm"] += 1
@@ -340,7 +389,6 @@ class SimpleForagingModel:
             if 0 <= x < self.width and 0 <= y < self.height:
                 if is_llm_controlled_ant:
                     self.foraging_efficiency_grid[x, y] += self.food_collection_score_boost
-            # --- END ADDITION ---
 
     def place_food(self, pos):
         if pos not in self.foods:
@@ -352,7 +400,37 @@ class SimpleForagingModel:
     def get_food_positions(self):
         return list(self.foods)
 
-# FIXED: Queen agent class
+    def deposit_pheromone(self, pos, p_type, amount):
+        """Deposits a specified amount of pheromone at a given position."""
+        if 0 <= pos[0] < self.width and 0 <= pos[1] < self.height:
+            self.pheromone_map[p_type][pos[0], pos[1]] += amount
+            # Clip to max value
+            self.pheromone_map[p_type][pos[0], pos[1]] = min(self.pheromone_map[p_type][pos[0], pos[1]], self.max_pheromone_value)
+
+    def get_local_pheromones(self, pos, radius):
+        """Returns the sum of pheromone levels in a given radius around a position."""
+        x, y = pos
+        local_trail = 0.0
+        local_alarm = 0.0
+        local_recruitment = 0.0
+
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    local_trail += self.pheromone_map['trail'][nx, ny]
+                    local_alarm += self.pheromone_map['alarm'][nx, ny]
+                    local_recruitment += self.pheromone_map['recruitment'][nx, ny]
+        
+        # Normalize by area to prevent larger radius always meaning more pheromone
+        area = (2 * radius + 1)**2
+        return {
+            'trail': local_trail / area,
+            'alarm': local_alarm / area,
+            'recruitment': local_recruitment / area
+        }
+
+# Queen agent class
 class QueenAnt:
     def __init__(self, model, use_llm=False):
         self.model = model
@@ -398,23 +476,20 @@ class QueenAnt:
             st.warning("IO Client not initialized for Queen Ant. Falling back to heuristic guidance.")
             return self._guide_with_heuristic()
 
-        # Simplified state for LLM
-        state_summary = {
-            "step": self.model.step_count,
-            "ants": [
-                {
-                    "id": ant.unique_id,
-                    "pos": list(ant.pos),
-                    "carrying": ant.carrying_food,
-                    "type": "LLM" if ant.is_llm_controlled else "Rule"
-                }
-                for ant in self.model.ants
-            ],
-            "foods": [list(f) for f in list(self.model.foods)[:10]],  # Limit to first 10 foods
-            "grid": [self.model.width, self.model.height]
-        }
+        # Summarize global pheromone information for the Queen (from my previous version)
+        max_trail_val = np.max(self.model.pheromone_map['trail'])
+        max_alarm_val = np.max(self.model.pheromone_map['alarm'])
+        max_recruitment_val = np.max(self.model.pheromone_map['recruitment'])
 
-        # Simplified prompt
+        # Find approximate locations of max pheromones (for prompt brevity)
+        trail_locs = np.argwhere(self.model.pheromone_map['trail'] == max_trail_val)
+        alarm_locs = np.argwhere(self.model.pheromone_map['alarm'] == max_alarm_val)
+        recruitment_locs = np.argwhere(self.model.pheromone_map['recruitment'] == max_recruitment_val)
+
+        trail_pos_str = f"({trail_locs[0][0]}, {trail_locs[0][1]})" if trail_locs.size > 0 else "N/A"
+        alarm_pos_str = f"({alarm_locs[0][0]}, {alarm_locs[0][1]})" if alarm_locs.size > 0 else "N/A"
+        recruitment_pos_str = f"({recruitment_locs[0][0]}, {recruitment_locs[0][1]})" if recruitment_locs.size > 0 else "N/A"
+
         prompt = f"""You are a Queen Ant. Guide your worker ants efficiently.
 
 Current situation:
@@ -423,7 +498,13 @@ Current situation:
 - Ants: {len(self.model.ants)} (some carrying food)
 - Food sources: {len(self.model.foods)} remaining
 
+Pheromone Map Summary:
+- Max Trail Pheromone: {max_trail_val:.2f} at {trail_pos_str} (indicates successful paths/food)
+- Max Alarm Pheromone: {max_alarm_val:.2f} at {alarm_pos_str} (indicates problems/dead ends)
+- Max Recruitment Pheromone: {max_recruitment_val:.2f} at {recruitment_pos_str} (indicates areas needing help or exploration)
+
 For each ant, suggest the best next position (adjacent to current position or stay).
+Consider pheromones: Encourage ants towards high trail, away from high alarm, and towards high recruitment if appropriate.
 Respond ONLY with valid JSON like: {{"guidance": {{"0": [x,y], "1": [x,y]}}, "report": "brief status"}}
 
 Ant positions and nearby food:
@@ -522,6 +603,14 @@ with st.sidebar.expander("👑 Queen Ant Settings", expanded=True):
     else:
         use_llm_queen = False
 
+with st.sidebar.expander("✨ Pheromone Settings", expanded=True):
+    pheromone_decay_rate = st.slider("Pheromone Decay Rate", 0.01, 0.2, 0.05, 0.01)
+    trail_deposit = st.slider("Trail Pheromone Deposit", 0.1, 5.0, 1.0, 0.1)
+    alarm_deposit = st.slider("Alarm Pheromone Deposit", 0.1, 5.0, 2.0, 0.1)
+    recruitment_deposit = st.slider("Recruitment Pheromone Deposit", 0.1, 5.0, 1.5, 0.1)
+    max_pheromone_value = st.slider("Max Pheromone Value", 5.0, 20.0, 10.0, 0.5)
+
+
 max_steps = st.sidebar.slider("Maximum Simulation Steps", 10, 1000, 200)
 
 # Store values in session state
@@ -529,7 +618,10 @@ for key, value in [
     ('grid_width', grid_width), ('grid_height', grid_height), ('n_food', n_food),
     ('n_ants', n_ants), ('agent_type', agent_type), ('selected_model', selected_model),
     ('prompt_style', prompt_style), ('use_queen', use_queen), ('use_llm_queen', use_llm_queen),
-    ('max_steps', max_steps)
+    ('max_steps', max_steps),
+    ('pheromone_decay_rate', pheromone_decay_rate), ('trail_deposit', trail_deposit),
+    ('alarm_deposit', alarm_deposit), ('recruitment_deposit', recruitment_deposit),
+    ('max_pheromone_value', max_pheromone_value)
 ]:
     st.session_state[key] = value
 
@@ -549,6 +641,13 @@ def run_comparison_simulation(params, num_steps_for_comparison=100):
         selected_model_param=params['selected_model'],
         prompt_style_param=params['prompt_style']
     )
+    # Apply pheromone settings for comparison run
+    model.pheromone_decay_rate = params['pheromone_decay_rate']
+    model.trail_deposit = params['trail_deposit']
+    model.alarm_deposit = params['alarm_deposit']
+    model.recruitment_deposit = params['recruitment_deposit']
+    model.max_pheromone_value = params['max_pheromone_value']
+
 
     for _ in range(num_steps_for_comparison):
         if len(model.foods) == 0:
@@ -572,6 +671,13 @@ def main():
                     grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
                     selected_model, prompt_style
                 )
+                # Apply pheromone settings from sidebar to the live model
+                st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
+                st.session_state.model.trail_deposit = trail_deposit
+                st.session_state.model.alarm_deposit = alarm_deposit
+                st.session_state.model.recruitment_deposit = recruitment_deposit
+                st.session_state.model.max_pheromone_value = max_pheromone_value
+                
                 st.session_state.compare_results = None
 
         with col_btn2:
@@ -610,12 +716,18 @@ def main():
     if 'current_step' not in st.session_state:
         st.session_state.current_step = 0
 
-    # Create model if not exists
+    # Create model if not exists (or if reset)
     if 'model' not in st.session_state:
         st.session_state.model = SimpleForagingModel(
             grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
             selected_model, prompt_style
         )
+        # Apply pheromone settings from sidebar to the initial model
+        st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
+        st.session_state.model.trail_deposit = trail_deposit
+        st.session_state.model.alarm_deposit = alarm_deposit
+        st.session_state.model.recruitment_deposit = recruitment_deposit
+        st.session_state.model.max_pheromone_value = max_pheromone_value
 
     model = st.session_state.model
 
@@ -623,11 +735,8 @@ def main():
     st.subheader("🗺️ Live Simulation Visualization")
     fig = go.Figure()
 
-    # --- ADD THESE LINES TO INTEGRATE THE HEATMAP (This is the new "Step 2" for main()) ---
-    # Get the foraging efficiency grid data
+    # Add the foraging efficiency heatmap as the first trace so it's in the background
     efficiency_data = st.session_state.model.foraging_efficiency_grid
-
-    # Add the heatmap as the first trace so it's in the background
     fig.add_trace(go.Heatmap(
         z=efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
         x=np.arange(model.width),
@@ -638,10 +747,8 @@ def main():
         hoverinfo='skip', # Don't show hover info for heatmap cells
         name='LLM Foraging Hotspot', # Name for legend
         zmin=0, # Minimum value for color scale
-        zmax=np.max(efficiency_data) * 1.2 # Scale max dynamically for visual effect
+        zmax=np.max(efficiency_data) * 1.2 if np.max(efficiency_data) > 0 else 1 # Scale max dynamically for visual effect, handle zero case
     ))
-    # --- END ADDITION ---
-
 
 
     # Add food items
@@ -698,6 +805,63 @@ def main():
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgrey')
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # Pheromone Map Visualizations (from my previous version)
+    st.subheader("🧪 Pheromone Maps")
+    
+    pheromone_cols = st.columns(3)
+
+    # Trail Pheromone Heatmap
+    with pheromone_cols[0]:
+        st.markdown("##### Trail Pheromone")
+        fig_trail = go.Figure(data=go.Heatmap(
+            z=model.pheromone_map['trail'].T, # Transpose for correct orientation
+            x=list(range(model.width)),
+            y=list(range(model.height)),
+            colorscale='Greens',
+            zmin=0, zmax=model.max_pheromone_value
+        ))
+        fig_trail.update_layout(
+            xaxis=dict(title="X"), yaxis=dict(title="Y"),
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=300
+        )
+        st.plotly_chart(fig_trail, use_container_width=True)
+
+    # Alarm Pheromone Heatmap
+    with pheromone_cols[1]:
+        st.markdown("##### Alarm Pheromone")
+        fig_alarm = go.Figure(data=go.Heatmap(
+            z=model.pheromone_map['alarm'].T, # Transpose for correct orientation
+            x=list(range(model.width)),
+            y=list(range(model.height)),
+            colorscale='Reds',
+            zmin=0, zmax=model.max_pheromone_value
+        ))
+        fig_alarm.update_layout(
+            xaxis=dict(title="X"), yaxis=dict(title="Y"),
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=300
+        )
+        st.plotly_chart(fig_alarm, use_container_width=True)
+
+    # Recruitment Pheromone Heatmap
+    with pheromone_cols[2]:
+        st.markdown("##### Recruitment Pheromone")
+        fig_recruitment = go.Figure(data=go.Heatmap(
+            z=model.pheromone_map['recruitment'].T, # Transpose for correct orientation
+            x=list(range(model.width)),
+            y=list(range(model.height)),
+            colorscale='Blues',
+            zmin=0, zmax=model.max_pheromone_value
+        ))
+        fig_recruitment.update_layout(
+            xaxis=dict(title="X"), yaxis=dict(title="Y"),
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=300
+        )
+        st.plotly_chart(fig_recruitment, use_container_width=True)
+
 
     # Queen's Report Section
     st.subheader("👑 Queen's Anomaly Report")
@@ -758,27 +922,20 @@ def main():
                                         markers=True)
                 st.plotly_chart(fig_depletion, use_container_width=True)
 
-        # --- STEP 5 FOR THE FORAGING EFFICIENCY MAP ---
+        # Teammate's commented out Foraging Efficiency Map visualization (kept commented)
         #st.write("### 🌐 Foraging Efficiency Map (LLM Activity)")
-        # Get the grid data
         #efficiency_data = st.session_state.model.foraging_efficiency_grid
-
-        # Create a heatmap
         #fig_efficiency = px.imshow(efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
-                                    #color_continuous_scale="Hot", # Use a "hot" color scale
-                                    #labels=dict(x="X Position", y="Y Position", color="Efficiency Score"),
-                                    #title="LLM Foraging Activity Hotspot",
-                                    #origin="lower", # Important for correct Y-axis orientation
-                                    #range_color=[0, np.max(efficiency_data) * 1.2]) # Scale color range dynamically
-
-        # Customize layout for better visualization
+        #                            color_continuous_scale="Hot", # Use a "hot" color scale
+        #                            labels=dict(x="X Position", y="Y Position", color="Efficiency Score"),
+        #                            title="LLM Foraging Activity Hotspot",
+        #                            origin="lower", # Important for correct Y-axis orientation
+        #                            range_color=[0, np.max(efficiency_data) * 1.2]) # Scale color range dynamically
         #fig_efficiency.update_xaxes(side="top", showgrid=False, zeroline=False,
-                                    #tickvals=np.arange(model.width), ticktext=np.arange(model.width))
+        #                            tickvals=np.arange(model.width), ticktext=np.arange(model.width))
         #fig_efficiency.update_yaxes(showgrid=False, zeroline=False,
-                                    #tickvals=np.arange(model.height), ticktext=np.arange(model.height))
-
+        #                            tickvals=np.arange(model.height), ticktext=np.arange(model.height))
         #st.plotly_chart(fig_efficiency, use_container_width=True)
-        # --- END ADDITION ---
 
     # Comparison section
     st.markdown("---")
@@ -791,7 +948,12 @@ def main():
                 'n_ants': n_ants, 'n_food': n_food,
                 'agent_type': agent_type, 'with_queen': False,
                 'use_llm_queen': False, 'selected_model': selected_model,
-                'prompt_style': prompt_style
+                'prompt_style': prompt_style,
+                'pheromone_decay_rate': pheromone_decay_rate, # Pass pheromone params
+                'trail_deposit': trail_deposit,
+                'alarm_deposit': alarm_deposit,
+                'recruitment_deposit': recruitment_deposit,
+                'max_pheromone_value': max_pheromone_value
             }
             food_no_queen = run_comparison_simulation(no_queen_params)
 
@@ -829,6 +991,13 @@ def main():
         - Prompt Style: {prompt_style}
         - Queen Overseer: {'Enabled' if use_queen else 'Disabled'} ({'LLM-Powered' if use_llm_queen and use_queen else 'Heuristic' if use_queen else 'N/A'})
         - Max Steps: {max_steps}
+
+        **Pheromone Configuration:**
+        - Decay Rate: {pheromone_decay_rate}
+        - Trail Deposit: {trail_deposit}
+        - Alarm Deposit: {alarm_deposit}
+        - Recruitment Deposit: {recruitment_deposit}
+        - Max Pheromone Value: {max_pheromone_value}
 
         **Current Status:**
         - Step: {model.step_count}/{max_steps}
