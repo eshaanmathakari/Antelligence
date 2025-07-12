@@ -241,7 +241,11 @@ class SimpleForagingModel:
             self.io_client = None
             
         # initializing LLM queens report
-        self.queen_llm_anomaly_rep="Queen's report will appear here when queen is active" 
+        self.queen_llm_anomaly_rep="Queen's report will appear here when queen is active"
+
+        # History for plotting food depletion
+        self.food_depletion_history = []
+        self.initial_food_count = N_food # Store initial food for 'total food remaining' calculation 
 
 
         # Create agents based on type
@@ -272,6 +276,15 @@ class SimpleForagingModel:
                 self.metrics["ants_carrying_food"] += 1
             if ant.is_llm_controlled:
                 self.metrics["total_api_calls"] += ant.api_calls # Accumulate API calls
+
+        # Calculate remaining food piles
+        food_piles_remaining = len(self.foods)
+
+        # Append to history for plotting
+        self.food_depletion_history.append({
+            "step": self.step_count,
+            "food_piles_remaining": food_piles_remaining
+        })        
 
 
     def get_neighborhood(self, x, y):
@@ -678,7 +691,7 @@ def main():
     # Display the plot
     st.plotly_chart(fig, use_container_width=True)
 
-     # --- NEW SECTION FOR QUEEN'S REPORT ---
+     # --- SECTION FOR QUEEN'S REPORT ---
     st.subheader("👑 Queen's Anomaly Report")
     if st.session_state.model.queen and st.session_state.model.use_llm_queen:
         report = st.session_state.model.queen_llm_anomaly_rep
@@ -695,7 +708,7 @@ def main():
         st.info("Queen Overseer is enabled, but not using LLM for reports (Heuristic mode).")
     else:
         st.info("Queen Overseer is disabled. Enable in sidebar to see reports.")
-    # --- END NEW SECTION ---
+    # --- END QUEEN'S SECTION ---
 
     # Simulation execution
     if st.session_state.simulation_running and model.step_count < max_steps:
@@ -739,6 +752,23 @@ def main():
         with col_p2:
             # API Calls Metric
             st.metric("Total API Calls (Live Sim)", model.metrics['total_api_calls'])
+
+        # --- FOOD RESOURCE DEPLETION ---
+        if st.session_state.model.food_depletion_history: # Ensure history is not empty
+            st.write("### 🌳 Food Piles Remaining Over Time") # Updated title here
+            # Convert history to DataFrame
+            df_food_depletion = pd.DataFrame(st.session_state.model.food_depletion_history)
+
+            # Create the line chart
+            fig_depletion = px.line(df_food_depletion,
+                                    x="step",
+                                    y="food_piles_remaining",
+                                    title="Food Piles Remaining Over Time", # Title within the chart
+                                    labels={"step": "Simulation Step", "food_piles_remaining": "Food Piles Remaining"},
+                                    markers=True) # Add markers for clarity at each step
+
+            st.plotly_chart(fig_depletion, use_container_width=True)
+        # --- END OF SECTION ---    
 
     st.markdown("---")
     st.subheader("📊 Comparison: Queen vs No-Queen")
