@@ -4,17 +4,16 @@ async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying with:", deployer.address);
 
-  // 1. FoodToken
   const FoodToken = await ethers.getContractFactory("FoodToken");
   const food = await FoodToken.deploy(deployer.address);
-  await food.deployed();
-  console.log("FoodToken ➜", food.address);
+  await food.waitForDeployment();
+  console.log("FoodToken ➜", await food.getAddress());
 
-  // 2. ColonyMemory
   const ColonyMemory = await ethers.getContractFactory("ColonyMemory");
   const memory = await ColonyMemory.deploy();
-  await memory.deployed();
-  console.log("ColonyMemory ➜", memory.address);
+  await memory.waitForDeployment();
+  console.log("ColonyMemory ➜", await memory.getAddress());
+
 }
 
 main().catch((e) => {
