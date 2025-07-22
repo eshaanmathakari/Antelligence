@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt # Now import pyplot after setting backend
 # Load environment variables
 load_dotenv()
 IO_API_KEY = os.getenv("IO_SECRET_KEY")
+
 # Page configuration
 st.set_page_config(
     page_title="IO-Powered Ant Foraging Simulation",
@@ -34,7 +35,7 @@ st.set_page_config(
 try:
     # Ensure this import path is correct relative to your project structure
     # If you run app.py from the root, and blockchain is a folder with __init__.py, this is correct.
-    from blockchain.client import w3, acct
+    from blockchain.client import w3, acct, MEMORY_CONTRACT_ADDRESS # Import MEMORY_CONTRACT_ADDRESS
     BLOCKCHAIN_ENABLED = True
     st.success("Blockchain client loaded successfully!")
 except Exception as e:
@@ -148,20 +149,46 @@ class SimpleAntAgent:
             self.steps_since_food = 0 # Reset counter (Pheromone Feature)
             # Deposit a strong trail pheromone upon successful food pickup (Pheromone Feature)
             self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 2)
-            
+
             # --- Blockchain Integration: Log food collection (New Feature) ---
             if BLOCKCHAIN_ENABLED:
                 try:
-                    # Call a contract function to log food collection
-                    # This assumes your contract has a function like logFoodCollection(uint antId, uint x, uint y)
-                    tx_hash = w3.eth.contract(address=self.model.contract_address, abi=self.model.contract_abi).functions.logFoodCollection(
+                    # Use MEMORY_CONTRACT_ADDRESS and its ABI for logging food collection
+                    # Ensure the ABI loaded into self.model.contract_abi is for ColonyMemory
+                    
+                    # Convert the contract_address to its checksummed format
+                    # Use MEMORY_CONTRACT_ADDRESS from blockchain.client
+                    checksum_memory_contract_address = w3.to_checksum_address(MEMORY_CONTRACT_ADDRESS)
+
+                    # Use the checksummed address and the correct ABI (which should be for ColonyMemory)
+                    memory_contract = w3.eth.contract(address=checksum_memory_contract_address, abi=self.model.contract_abi)
+
+                    # Get the nonce for the sending account (crucial for transaction ordering)
+                    nonce = w3.eth.get_transaction_count(acct.address)
+
+                    # Build the transaction dictionary, calling 'recordFood'
+                    # Note: unique_id is uint256, pos[0] and pos[1] are uint32 in Solidity
+                    tx = memory_contract.functions.recordFood( # Changed from logFoodCollection to recordFood
                         self.unique_id, self.pos[0], self.pos[1]
-                    ).transact({'from': acct.address})
+                    ).build_transaction({
+                        'chainId': w3.eth.chain_id,
+                        'gas': 200000, # A reasonable gas limit for a simple function call
+                        'gasPrice': w3.eth.gas_price, # Get current network gas price
+                        'nonce': nonce,
+                        'from': acct.address # This specifies the sender, but the signing happens locally
+                    })
+
+                    # Sign the transaction locally with the private key
+                    signed_tx = w3.eth.account.sign_transaction(tx, acct.key)
+
+                    # Send the signed raw transaction to the network
+                    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                    
                     st.session_state.blockchain_logs.append(f"Food collected by Ant {self.unique_id} at {self.pos}. Tx: {tx_hash.hex()}")
                 except Exception as b_e:
                     st.session_state.blockchain_logs.append(f"Blockchain log failed for Ant {self.unique_id}: {b_e}")
             # --- End Blockchain Integration ---
-
+            
         else:
             self.steps_since_food += 1 # (Pheromone Feature)
             # If LLM ant hasn't found food for a while, deposit recruitment pheromone (Pheromone Feature)
@@ -320,8 +347,9 @@ class SimpleForagingModel:
         # --- END ADDITION ---
 
         # --- Blockchain Contract Details (New Feature) ---
-        self.contract_address = None # To be set from Streamlit input
-        self.contract_abi = None # To be set from Streamlit input
+        # These will be set from Streamlit input, but initialized here
+        self.contract_address = None 
+        self.contract_abi = None 
         # --- End Blockchain Contract Details ---
 
         # Create agents based on type
@@ -644,33 +672,156 @@ with st.sidebar.expander("✨ Pheromone Settings", expanded=True):
 if BLOCKCHAIN_ENABLED:
     with st.sidebar.expander("🔗 Blockchain Settings", expanded=True):
         st.info("Ensure your local blockchain node is running and PRIVATE_KEY is set in .env")
-        contract_address = st.text_input("Smart Contract Address", value="0xYourDeployedContractAddressHere")
-        # For simplicity, ABI is hardcoded or loaded from a file. For a real app, load from build artifact.
-        # This is a placeholder ABI for a simple logFoodCollection function.
-        # You'll need to replace this with your actual contract's ABI.
-        contract_abi = st.text_area("Smart Contract ABI (JSON)", value="""
+        # The address should be the deployed address of your ColonyMemory contract
+        contract_address = st.text_input("ColonyMemory Contract Address", value=MEMORY_CONTRACT_ADDRESS if MEMORY_CONTRACT_ADDRESS else "0xYourColonyMemoryContractAddressHere")
+        
+        # This ABI must be the ABI for the ColonyMemory contract
+        contract_abi = st.text_area("ColonyMemory Contract ABI (JSON)", value="""
         [
             {
+                "anonymous": false,
                 "inputs": [
-                    {"internalType": "uint256","name": "antId","type": "uint256"},
-                    {"internalType": "uint256","name": "x","type": "uint256"},
-                    {"internalType": "uint256","name": "y","type": "uint256"}
+                    {
+                        "components": [
+                            {
+                                "internalType": "uint32",
+                                "name": "x",
+                                "type": "uint32"
+                            },
+                            {
+                                "internalType": "uint32",
+                                "name": "y",
+                                "type": "uint32"
+                            },
+                            {
+                                "internalType": "address",
+                                "name": "ant",
+                                "type": "address"
+                            }
+                        ],
+                        "indexed": false,
+                        "internalType": "struct ColonyMemory.Visit",
+                        "name": "v",
+                        "type": "tuple"
+                    }
                 ],
-                "name": "logFoodCollection",
+                "name": "CellVisited",
+                "type": "event"
+            },
+            {
+                "anonymous": false,
+                "inputs": [
+                    {
+                        "indexed": false,
+                        "internalType": "uint256",
+                        "name": "tokenId",
+                        "type": "uint256"
+                    },
+                    {
+                        "indexed": false,
+                        "internalType": "uint32",
+                        "name": "x",
+                        "type": "uint32"
+                    },
+                    {
+                        "indexed": false,
+                        "internalType": "uint32",
+                        "name": "y",
+                        "type": "uint32"
+                    },
+                    {
+                        "indexed": false,
+                        "internalType": "address",
+                        "name": "ant",
+                        "type": "address"
+                    }
+                ],
+                "name": "FoodCollected",
+                "type": "event"
+            },
+            {
+                "inputs": [
+                    {
+                        "internalType": "uint32",
+                        "name": "x",
+                        "type": "uint32"
+                    },
+                    {
+                        "internalType": "uint32",
+                        "name": "y",
+                        "type": "uint32"
+                    }
+                ],
+                "name": "hasVisited",
+                "outputs": [
+                    {
+                        "internalType": "bool",
+                        "name": "",
+                        "type": "bool"
+                    }
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "inputs": [
+                    {
+                        "internalType": "uint32",
+                        "name": "x",
+                        "type": "uint32"
+                    },
+                    {
+                        "internalType": "uint32",
+                        "name": "y",
+                        "type": "uint32"
+                    }
+                ],
+                "name": "markVisited",
                 "outputs": [],
                 "stateMutability": "nonpayable",
                 "type": "function"
             },
             {
-                "anonymous": false,
                 "inputs": [
-                    {"indexed": true,"internalType": "uint256","name": "antId","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "x","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "y","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "timestamp","type": "uint256"}
+                    {
+                        "internalType": "uint256",
+                        "name": "id",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint32",
+                        "name": "x",
+                        "type": "uint32"
+                    },
+                    {
+                        "internalType": "uint32",
+                        "name": "y",
+                        "type": "uint32"
+                    }
                 ],
-                "name": "FoodCollected",
-                "type": "event"
+                "name": "recordFood",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [
+                    {
+                        "internalType": "bytes32",
+                        "name": "",
+                        "type": "bytes32"
+                    }
+                ],
+                "name": "visited",
+                "outputs": [
+                    {
+                        "internalType": "bool",
+                        "name": "",
+                        "type": "bool"
+                    }
+                ],
+                "stateMutability": "view",
+                "type": "function"
             }
         ]
         """)
@@ -752,7 +903,8 @@ def main():
                 st.session_state.model.max_pheromone_value = max_pheromone_value
                 
                 # Apply blockchain settings from sidebar to the live model (Blockchain Feature)
-                st.session_state.model.contract_address = contract_address
+                # Use MEMORY_CONTRACT_ADDRESS from client.py as default for contract_address
+                st.session_state.model.contract_address = MEMORY_CONTRACT_ADDRESS if BLOCKCHAIN_ENABLED else contract_address
                 try:
                     st.session_state.model.contract_abi = json.loads(contract_abi)
                 except json.JSONDecodeError:
@@ -815,7 +967,8 @@ def main():
         st.session_state.model.max_pheromone_value = max_pheromone_value
         
         # Apply blockchain settings from sidebar to the initial model (Blockchain Feature)
-        st.session_state.model.contract_address = contract_address
+        # Use MEMORY_CONTRACT_ADDRESS from client.py as default for contract_address
+        st.session_state.model.contract_address = MEMORY_CONTRACT_ADDRESS if BLOCKCHAIN_ENABLED else contract_address
         try:
             st.session_state.model.contract_abi = json.loads(contract_abi)
         except json.JSONDecodeError:
@@ -901,7 +1054,7 @@ def main():
     st.plotly_chart(fig, use_container_width=True)
 
     # Pheromone Map Visualizations (Pheromone Feature)
-    st.subheader("🧪 Pheromone Maps")
+    st.subheader("� Pheromone Maps")
     
     pheromone_cols = st.columns(3)
 
