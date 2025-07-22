@@ -1,346 +1,144 @@
-import streamlit as st
+import streamlit as st, os
+from blockchain.client import w3, acct
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from PIL import Image
 import pandas as pd
-import time
-import os
+import plotly.express as px
+import plotly.graph_objects as go
+import os, json, time, random
 from dotenv import load_dotenv
 import openai
-import random
-from random import choice
-import imageio.v2 as imageio
-from datetime import datetime
-import json
 
-# --- FIX: Set Matplotlib backend BEFORE importing matplotlib.pyplot ---
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt # Now import pyplot after setting backend
-# --- END FIX ---
-
-# Load environment variables
+# ──────────────────────────────  ENV  ──────────────────────────────
 load_dotenv()
-IO_API_KEY = os.getenv("IO_SECRET_KEY")
-# Page configuration
-st.set_page_config(
-    page_title="IO-Powered Ant Foraging Simulation",
-    page_icon="🐜",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-# --- Blockchain Integration (from teammate's code) ---
-try:
-    # Ensure this import path is correct relative to your project structure
-    # If you run app.py from the root, and blockchain is a folder with __init__.py, this is correct.
-    from blockchain.client import w3, acct
-    BLOCKCHAIN_ENABLED = True
-    st.success("Blockchain client loaded successfully!")
-except Exception as e:
-    BLOCKCHAIN_ENABLED = False
-    st.warning(f"Blockchain client could not be loaded: {e}. Blockchain features will be disabled.")
-# --- End Blockchain Integration ---
+IO_API_KEY = os.getenv("IO_SECRET_KEY", "")
 
+st.set_page_config(page_title="IO Ant-Foraging ‧ Queen Thoughts",
+                   page_icon="🐜", layout="wide",
+                   initial_sidebar_state="expanded")
+st.markdown("<h1 style='text-align:center'>🐜 IO-Powered Ant Foraging Simulation</h1>",
+            unsafe_allow_html=True)
 
-
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3em;
-        color: #FF6B6B;
-        text-align: center;
-        margin-bottom: 1em;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1em;
-        border-radius: 10px;
-        margin: 0.5em 0;
-    }
-    .stAlert {
-        border-radius: 10px;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Header
-st.markdown('<h1 class="main-header">🐜 IO-Powered Ant Foraging Simulation</h1>', unsafe_allow_html=True)
-st.markdown("**Hackathon Project**: Autonomous Agents powered by IO Intelligence API")
-
-# --- Class Definitions ---
+# ────────────────────────  ANT  ─────────────────────────
 class SimpleAntAgent:
-    def __init__(self, unique_id, model, is_llm_controlled=True):
-        self.unique_id = unique_id
-        self.model = model
-        self.carrying_food = False
-        self.pos = (np.random.randint(model.width), np.random.randint(model.height))
-        self.is_llm_controlled = is_llm_controlled
-        self.api_calls = 0
-        self.move_history = []
-        self.food_collected_count = 0
-        self.steps_since_food = 0 # For recruitment pheromone (Pheromone Feature)
+    def __init__(self, uid, model, llm=True):
+        self.uid, self.m, self.llm = uid, model, llm
+        self.pos = (np.random.randint(model.w), np.random.randint(model.h))
+        self.carry, self.api_calls = False, 0
 
-    def step(self, guided_pos=None):
-        x, y = self.pos
-        possible_steps = self.model.get_neighborhood(x, y)
-        new_position = self.pos
+    def _nbhd(self): return self.m.neigh(*self.pos)
+    def _nearest_food(self):
+        return min(self.m.foods,
+                   key=lambda f: abs(f[0]-self.pos[0])+abs(f[1]-self.pos[1])) if self.m.foods else None
+    def _step_toward(self, tgt):
+        return min(self._nbhd(), key=lambda n: abs(n[0]-tgt[0])+abs(n[1]-tgt[1])) if tgt else self.pos
 
-        # Pheromone deposition before moving (based on current state) (Pheromone Feature)
-        if self.carrying_food:
-            # Deposit trail pheromone when carrying food (implies returning from food source)
-            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 0.5) # Less intense when returning
-        elif self.model.is_food_at(self.pos):
-            # Deposit trail pheromone when at a food source
-            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5) # More intense at source
+    def _llm_action(self):
+        x,y = self.pos
+        near = any(abs(fx-x)<=2 and abs(fy-y)<=2 for fx,fy in self.m.foods)
+        prompt=f"Ant at ({x},{y}) carrying={self.carry}, food_nearby={near}. Word: toward/random/stay."
+        rsp=self.m.io.chat.completions.create(
+            model=self.m.llm_name,
+            messages=[{"role":"system","content":"Return one word: toward, random, stay."},
+                      {"role":"user","content":prompt}],
+            temperature=0.3,max_completion_tokens=10)
+        return rsp.choices[0].message.content.strip().lower()
 
-        if guided_pos and guided_pos in possible_steps + [self.pos]:
-            # Queen guidance takes priority
-            new_position = guided_pos
-        elif self.is_llm_controlled and self.model.io_client:
+    def step(self, guide=None):
+        moves=self._nbhd(); nxt=self.pos
+        if guide and guide in moves+[self.pos]:
+            nxt=guide
+        elif self.llm and self.m.io:
             try:
-                action = self.ask_io_for_decision(self.model.prompt_style, self.model.selected_model)
-                self.api_calls += 1
-                if action == "toward" and possible_steps:
-                    target_food = self._find_nearest_food()
-                    if target_food:
-                        new_position = self._step_toward(self.pos, target_food)
-                    else:
-                        new_position = choice(possible_steps)
-                elif action == "random" and possible_steps:
-                    new_position = choice(possible_steps)
-                elif action == "stay":
-                    new_position = self.pos
-                else:
-                    new_position = choice(possible_steps) if possible_steps else self.pos
-            except Exception as e:
-                # Deposit alarm pheromone on API error (Pheromone Feature)
-                self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5) # More intense alarm for API error
-                if possible_steps:
-                    new_position = choice(possible_steps)
-                else:
-                    new_position = self.pos
-        else:
-            # Rule-based behavior
-            if self.model.is_food_at(self.pos) and not self.carrying_food:
-                new_position = self.pos  # Stay to pick up food
-            elif self.carrying_food:
-                # Move towards nest/home (center of grid for simplicity)
-                home = (self.model.width // 2, self.model.height // 2)
-                new_position = self._step_toward(self.pos, home)
+                act=self._llm_action(); self.api_calls+=1
+                if act=="toward": nxt=self._step_toward(self._nearest_food()) or random.choice(moves)
+                elif act=="random": nxt=random.choice(moves)
+            except: nxt=random.choice(moves)
+        else:  # rule
+            if self.m.is_food(self.pos) and not self.carry: nxt=self.pos
+            elif self.carry: nxt=self._step_toward((self.m.w//2,self.m.h//2))
             else:
-                target_food = self._find_nearest_food()
-                if target_food:
-                    new_position = self._step_toward(self.pos, target_food)
-                else:
-                    new_position = choice(possible_steps) if possible_steps else self.pos
+                tgt=self._nearest_food(); nxt=self._step_toward(tgt) if tgt else random.choice(moves)
+        self.pos=nxt
 
-        self.move_history.append(self.pos)
-        self.pos = new_position
+        # pick/drop
+        if self.m.is_food(self.pos) and not self.carry:
+            self.carry=True; self.m.foods.discard(self.pos)
+            if self.llm: self.m.metrics["food_collected_by_llm"]+=1
+            else: self.m.metrics["food_collected_by_rule"]+=1
+        if self.carry and not self.llm:
+            nest=(self.m.w//2,self.m.h//2)
+            if abs(self.pos[0]-nest[0])<=1 and abs(self.pos[1]-nest[1])<=1 and random.random()<0.3:
+                self.carry=False
 
-        # Food pickup/drop logic
-        if self.model.is_food_at(self.pos) and not self.carrying_food:
-            # Pick up food
-            self.carrying_food = True
-            self.model.collect_food(self.pos, self.is_llm_controlled)
-            self.food_collected_count += 1
-            self.steps_since_food = 0 # Reset counter (Pheromone Feature)
-            # Deposit a strong trail pheromone upon successful food pickup (Pheromone Feature)
-            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 2)
-            
-            # --- Blockchain Integration: Log food collection (New Feature) ---
-            if BLOCKCHAIN_ENABLED:
-                try:
-                    # Call a contract function to log food collection
-                    # This assumes your contract has a function like logFoodCollection(uint antId, uint x, uint y)
-                    tx_hash = w3.eth.contract(address=self.model.contract_address, abi=self.model.contract_abi).functions.logFoodCollection(
-                        self.unique_id, self.pos[0], self.pos[1]
-                    ).transact({'from': acct.address})
-                    st.session_state.blockchain_logs.append(f"Food collected by Ant {self.unique_id} at {self.pos}. Tx: {tx_hash.hex()}")
-                except Exception as b_e:
-                    st.session_state.blockchain_logs.append(f"Blockchain log failed for Ant {self.unique_id}: {b_e}")
-            # --- End Blockchain Integration ---
+# ────────────────────────  QUEEN  ─────────────────────────
+class QueenAnt:
+    def __init__(self, model, llm=True):
+        self.m,self.llm=model,llm
+        self.thought="Not yet acted."
 
-        else:
-            self.steps_since_food += 1 # (Pheromone Feature)
-            # If LLM ant hasn't found food for a while, deposit recruitment pheromone (Pheromone Feature)
-            if self.is_llm_controlled and self.steps_since_food > 10 and not self.carrying_food:
-                self.model.deposit_pheromone(self.pos, 'recruitment', self.model.recruitment_deposit)
-        
-        # Only drop food at nest/home for rule-based ants, never randomly for LLM ants
-        if self.carrying_food and not self.is_llm_controlled:
-            home = (self.model.width // 2, self.model.height // 2)
-            # Drop food if at home position or very close to it
-            if abs(self.pos[0] - home[0]) <= 1 and abs(self.pos[1] - home[1]) <= 1:
-                if random.random() < 0.3:  # 30% chance to drop at home
-                    self.carrying_food = False
-                    # Don't place food back on grid when dropping at home
-                    # Deposit trail pheromone at nest when dropping food (Pheromone Feature)
-                    self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5)
+    def guide(self):
+        if not self.m.foods:
+            self.thought="No food → no guidance."
+            return {}
+        return self._llm() if self.llm else self._heuristic()
 
-    def _find_nearest_food(self):
-        if not self.model.foods:
-            return None
-        return min(self.model.foods,
-                   key=lambda f: abs(f[0]-self.pos[0]) + abs(f[1]-self.pos[1]))
+    def _heuristic(self):
+        g,lines={},[]
+        for a in self.m.ants:
+            tgt=min(self.m.foods,key=lambda f:abs(f[0]-a.pos[0])+abs(f[1]-a.pos[1]))
+            step=min(self.m.neigh(*a.pos)+[a.pos],key=lambda n:abs(n[0]-tgt[0])+abs(n[1]-tgt[1]))
+            g[a.uid]=step; lines.append(f"{a.uid}→{step}")
+        self.thought="Heuristic | " + ", ".join(lines)
+        return g
 
-    def _step_toward(self, start, target):
-        x, y = start
-        tx, ty = target
-        possible_moves = self.model.get_neighborhood(x, y)
-        if not possible_moves:
-            return start
-        return min(possible_moves, key=lambda n: abs(n[0]-tx)+abs(n[1]-ty))
-
-    def ask_io_for_decision(self, prompt_style_param, selected_model_param):
-        x, y = self.pos
-        food_nearby = any(
-            abs(fx - x) <= 2 and abs(fy - y) <= 2
-            for fx, fy in self.model.get_food_positions()
-        )
-        
-        # Get local pheromone information (Pheromone Feature)
-        local_pheromones = self.model.get_local_pheromones(self.pos, radius=2)
-        
-        pheromone_info = (
-            f"Local Pheromones (radius 2): "
-            f"Trail: {local_pheromones['trail']:.2f}, "
-            f"Alarm: {local_pheromones['alarm']:.2f}, "
-            f"Recruitment: {local_pheromones['recruitment']:.2f}. "
-        )
-
-        if prompt_style_param == "Structured":
-            prompt = (
-                f"You are an ant at position ({x},{y}) on a {self.model.width}x{self.model.height} grid. "
-                f"Food nearby: {food_nearby}. Carrying food: {self.carrying_food}. "
-                f"{pheromone_info}" # Pheromone Feature
-                "Should you move 'toward' food, move 'random', or 'stay'? "
-                "Consider the pheromones: high trail means good path, high alarm means danger, high recruitment means others need help or found something. " # Pheromone Feature
-                "Reply with only one word: 'toward', 'random', or 'stay'."
-            )
-        elif prompt_style_param == "Autonomous":
-            prompt = (
-                f"As an autonomous ant foraging for food, my current state is: "
-                f"Position: ({x},{y}), "
-                f"Food available nearby: {food_nearby}, "
-                f"Currently carrying food: {self.carrying_food}. "
-                f"{pheromone_info}" # Pheromone Feature
-                "What is the best action? Choose: 'toward', 'random', or 'stay'. "
-                "Interpret pheromone signals: Strong trail suggests a good path, strong alarm suggests avoiding the area, strong recruitment suggests exploring or assisting." # Pheromone Feature
-            )
-        else:  # Adaptive
-            efficiency = self.food_collected_count
-            prompt = (
-                f"Ant {self.unique_id} has collected {efficiency} food items. "
-                f"Current position: ({x},{y}). "
-                f"Food nearby: {food_nearby}. "
-                f"Carrying food: {self.carrying_food}. "
-                f"{pheromone_info}" # Pheromone Feature
-                "Best action? Options: 'toward', 'random', 'stay'. "
-                "Use pheromones to guide your decision: Follow strong trails, avoid alarms, respond to recruitment calls." # Pheromone Feature
-            )
-
+    def _llm(self):
+        state={"step":self.m.step_cnt,
+               "ants":[{"id":a.uid,"pos":a.pos,"carry":a.carry} for a in self.m.ants],
+               "foods":list(self.m.foods)[:10],"grid":[self.m.w,self.m.h]}
+        prompt=("Return JSON {'guidance':{'0':[x,y]},'report':'text'} STATE:"
+                f"{json.dumps(state)}")
         try:
-            response = self.model.io_client.chat.completions.create(
-                model=selected_model_param,
-                messages=[
-                    {"role": "system", "content": "You are an intelligent ant. Respond with only one word: toward, random, or stay."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_completion_tokens=10
-            )
-            action = response.choices[0].message.content.strip().lower()
-            return action if action in ["toward", "random", "stay"] else "random"
+            rsp=self.m.io.chat.completions.create(
+                model=self.m.llm_name,
+                messages=[{"role":"system","content":"JSON only."},
+                          {"role":"user","content":prompt}],
+                temperature=0.1,max_completion_tokens=300)
+            txt=rsp.choices[0].message.content.strip()
+            data=json.loads(txt[txt.find("{"):txt.rfind("}")+1])
+            g={int(k):tuple(v) for k,v in data["guidance"].items()}
+            rep=data.get("report","(no report)")
+            self.thought=f"{rep} | guided: {len(g)} ants"
+            return g
         except Exception as e:
-            # Deposit alarm pheromone on API error (Pheromone Feature)
-            self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5) # More intense alarm for API error
-            return "random"
+            self.thought=f"LLM fail ({e}) → heuristic"
+            return self._heuristic()
 
-class SimpleForagingModel:
-    def __init__(self, width, height, N_ants, N_food,
-                 agent_type="LLM-Powered", with_queen=False, use_llm_queen=False,
-                 selected_model_param="meta-llama/Llama-3.3-70B-Instruct", prompt_style_param="Adaptive"):
-        self.width = width
-        self.height = height
-        self.foods = set()
-        
-        # Generate unique food positions
-        while len(self.foods) < N_food:
-            new_food_pos = (np.random.randint(width), np.random.randint(height))
-            self.foods.add(new_food_pos)
+# ────────────────────────  MODEL  ─────────────────────────
+class ForageModel:
+    def __init__(self,w,h,n_ants,n_food,agent_type,queen_on,queen_llm,llm_name):
+        self.w,self.h=w,h
+        self.foods=set((np.random.randint(w),np.random.randint(h)) for _ in range(n_food))
+        self.io=openai.OpenAI(api_key=IO_API_KEY,
+                              base_url="https://api.intelligence.io.solutions/api/v1/") if IO_API_KEY else None
+        self.llm_name=llm_name
+        self.metrics=dict(food_collected_by_llm=0,food_collected_by_rule=0,
+                          total_api_calls=0,ants_carrying_food=0)
+        self.ants=[SimpleAntAgent(i,self,
+                   (agent_type=="LLM-Powered")or(agent_type=="Hybrid" and i<n_ants//2))
+                   for i in range(n_ants)]
+        self.queen=QueenAnt(self,queen_llm) if queen_on else None
+        self.step_cnt=0
+        self.food_history=[{"step":0,"food":len(self.foods)}]
+        self.queen_log=[]; self.last_thought=""
 
-        self.step_count = 0
-        self.metrics = {
-            "food_collected": 0,
-            "total_api_calls": 0,
-            "avg_response_time": 0,
-            "food_collected_by_llm": 0,
-            "food_collected_by_rule": 0,
-            "ants_carrying_food": 0
-        }
-        self.with_queen = with_queen
-        self.use_llm_queen = use_llm_queen
-        self.selected_model = selected_model_param
-        self.prompt_style = prompt_style_param
-
-        # Pheromone map initialization (Pheromone Feature)
-        self.pheromone_map = {
-            'trail': np.zeros((width, height)),
-            'alarm': np.zeros((width, height)),
-            'recruitment': np.zeros((width, height))
-        }
-        self.pheromone_decay_rate = 0.05 # 5% decay per step
-        self.trail_deposit = 1.0
-        self.alarm_deposit = 2.0
-        self.recruitment_deposit = 1.5
-        self.max_pheromone_value = 10.0 # Upper bound for pheromone values
-
-        # Initialize IO client
-        if IO_API_KEY:
-            self.io_client = openai.OpenAI(
-                api_key=IO_API_KEY,
-                base_url="https://api.intelligence.io.solutions/api/v1/"
-            )
-        else:
-            self.io_client = None
-            
-        self.queen_llm_anomaly_rep = "Queen's report will appear here when queen is active"
-        self.food_depletion_history = []
-        self.initial_food_count = N_food
-
-        # --- FORAGING EFFICIENCY MAP (from teammate's code) ---
-        # Initialize the foraging efficiency grid
-        self.foraging_efficiency_grid = np.zeros((self.width, self.height))
-        # Define the decay rate for the grid values
-        self.foraging_decay_rate = 0.98 # Retains 98% of value each step, 2% decays
-        self.food_collection_score_boost = 10.0 # Score boost for collecting food
-        self.traverse_score_boost = 0.1 # Score boost for just traversing a cell
-        # --- END ADDITION ---
-
-        # --- Blockchain Contract Details (New Feature) ---
-        self.contract_address = None # To be set from Streamlit input
-        self.contract_abi = None # To be set from Streamlit input
-        # --- End Blockchain Contract Details ---
-
-        # Create agents based on type
-        self.ants = []
-        if agent_type == "LLM-Powered":
-            self.ants = [SimpleAntAgent(i, self, True) for i in range(N_ants)]
-        elif agent_type == "Rule-Based":
-            self.ants = [SimpleAntAgent(i, self, False) for i in range(N_ants)]
-        else:  # Hybrid
-            for i in range(N_ants):
-                is_llm = i < N_ants // 2
-                self.ants.append(SimpleAntAgent(i, self, is_llm))
-
-        self.queen = QueenAnt(self, use_llm=self.use_llm_queen) if self.with_queen else None
+    def neigh(self,x,y): 
+        return[(i,j)for i in range(x-1,x+2)for j in range(y-1,y+2)
+                                if(i,j)!=(x,y) and (0<=i<self.w and 0<=j<self.h)]
+    def is_food(self,pos): return pos in self.foods
 
     def step(self):
-        self.step_count += 1
-        guidance = {}
-        
+        self.step_cnt+=1
+        guidance={}
         if self.queen:
             try:
                 guidance = self.queen.guide(self.selected_model)
@@ -375,7 +173,7 @@ class SimpleForagingModel:
                     self.foraging_efficiency_grid[x, y] += self.traverse_score_boost
         # --- END ADDITION ---
 
-        # Apply pheromone evaporation and clipping after all ants have moved (Pheromone Feature)
+        # Apply pheromone evaporation and clipping after all ants have moved (from my previous version)
         for p_type in self.pheromone_map:
             self.pheromone_map[p_type] *= (1 - self.pheromone_decay_rate)
             self.pheromone_map[p_type] = np.clip(self.pheromone_map[p_type], 0, self.max_pheromone_value)
@@ -506,7 +304,7 @@ class QueenAnt:
             st.warning("IO Client not initialized for Queen Ant. Falling back to heuristic guidance.")
             return self._guide_with_heuristic()
 
-        # Summarize global pheromone information for the Queen (Pheromone Feature)
+        # Summarize global pheromone information for the Queen (from my previous version)
         max_trail_val = np.max(self.model.pheromone_map['trail'])
         max_alarm_val = np.max(self.model.pheromone_map['alarm'])
         max_recruitment_val = np.max(self.model.pheromone_map['recruitment'])
@@ -599,6 +397,34 @@ Ant positions and nearby food:
 
 # --- Sidebar configuration ---
 st.sidebar.header("🎛️ Simulation Configuration")
+st.sidebar.title("Antelligence ⚙️")
+st.sidebar.markdown(
+    f"🔌 **IO LLM** model: `Llama-3-70b-instruct`\n\n"
+    f"API endpoint: {os.getenv('IO_API_URL', 'io.net default')}"
+)
+
+# Presets
+preset = st.sidebar.selectbox(
+    "Load preset",
+    ("Beginner Demo", "LLM Challenge", "Swarm Party"),
+    help="Quick scenarios so you don't have to tweak every slider",
+)
+
+# Blockchain toggles
+with st.sidebar.expander("Blockchain"):
+    use_chain = st.toggle("Enable on-chain logging", value=True)
+    if use_chain:
+        st.write(f"📡 Connected to {w3.client_version.split('/')[0]}")
+        st.write(f"🪙 Ant wallet → {acct.address[:10]}…")
+
+# Legend
+st.markdown(
+    """
+    **Legend:**  
+    🟥 = ant carrying food | 🟦 = explorer ant | 🟢 = food | 🟡 = highest trail pheromone
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar.expander("🌍 Environment Settings", expanded=True):
     grid_width = st.slider("Grid Width", 10, 50, 20)
@@ -640,45 +466,6 @@ with st.sidebar.expander("✨ Pheromone Settings", expanded=True):
     recruitment_deposit = st.slider("Recruitment Pheromone Deposit", 0.1, 5.0, 1.5, 0.1)
     max_pheromone_value = st.slider("Max Pheromone Value", 5.0, 20.0, 10.0, 0.5)
 
-# --- Blockchain Settings (New Feature) ---
-if BLOCKCHAIN_ENABLED:
-    with st.sidebar.expander("🔗 Blockchain Settings", expanded=True):
-        st.info("Ensure your local blockchain node is running and PRIVATE_KEY is set in .env")
-        contract_address = st.text_input("Smart Contract Address", value="0xYourDeployedContractAddressHere")
-        # For simplicity, ABI is hardcoded or loaded from a file. For a real app, load from build artifact.
-        # This is a placeholder ABI for a simple logFoodCollection function.
-        # You'll need to replace this with your actual contract's ABI.
-        contract_abi = st.text_area("Smart Contract ABI (JSON)", value="""
-        [
-            {
-                "inputs": [
-                    {"internalType": "uint256","name": "antId","type": "uint256"},
-                    {"internalType": "uint256","name": "x","type": "uint256"},
-                    {"internalType": "uint256","name": "y","type": "uint256"}
-                ],
-                "name": "logFoodCollection",
-                "outputs": [],
-                "stateMutability": "nonpayable",
-                "type": "function"
-            },
-            {
-                "anonymous": false,
-                "inputs": [
-                    {"indexed": true,"internalType": "uint256","name": "antId","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "x","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "y","type": "uint256"},
-                    {"indexed": false,"internalType": "uint256","name": "timestamp","type": "uint256"}
-                ],
-                "name": "FoodCollected",
-                "type": "event"
-            }
-        ]
-        """)
-else:
-    contract_address = ""
-    contract_abi = ""
-# --- End Blockchain Settings ---
-
 
 max_steps = st.sidebar.slider("Maximum Simulation Steps", 10, 1000, 200)
 
@@ -690,8 +477,7 @@ for key, value in [
     ('max_steps', max_steps),
     ('pheromone_decay_rate', pheromone_decay_rate), ('trail_deposit', trail_deposit),
     ('alarm_deposit', alarm_deposit), ('recruitment_deposit', recruitment_deposit),
-    ('max_pheromone_value', max_pheromone_value),
-    ('contract_address', contract_address), ('contract_abi', contract_abi) # Blockchain Feature
+    ('max_pheromone_value', max_pheromone_value)
 ]:
     st.session_state[key] = value
 
@@ -711,16 +497,13 @@ def run_comparison_simulation(params, num_steps_for_comparison=100):
         selected_model_param=params['selected_model'],
         prompt_style_param=params['prompt_style']
     )
-    # Apply pheromone settings for comparison run (Pheromone Feature)
+    # Apply pheromone settings for comparison run
     model.pheromone_decay_rate = params['pheromone_decay_rate']
     model.trail_deposit = params['trail_deposit']
     model.alarm_deposit = params['alarm_deposit']
     model.recruitment_deposit = params['recruitment_deposit']
     model.max_pheromone_value = params['max_pheromone_value']
 
-    # Apply blockchain settings for comparison run (Blockchain Feature)
-    model.contract_address = params['contract_address']
-    model.contract_abi = json.loads(params['contract_abi']) if params['contract_abi'] else None
 
     for _ in range(num_steps_for_comparison):
         if len(model.foods) == 0:
@@ -744,22 +527,13 @@ def main():
                     grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
                     selected_model, prompt_style
                 )
-                # Apply pheromone settings from sidebar to the live model (Pheromone Feature)
+                # Apply pheromone settings from sidebar to the live model
                 st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
                 st.session_state.model.trail_deposit = trail_deposit
                 st.session_state.model.alarm_deposit = alarm_deposit
                 st.session_state.model.recruitment_deposit = recruitment_deposit
                 st.session_state.model.max_pheromone_value = max_pheromone_value
                 
-                # Apply blockchain settings from sidebar to the live model (Blockchain Feature)
-                st.session_state.model.contract_address = contract_address
-                try:
-                    st.session_state.model.contract_abi = json.loads(contract_abi)
-                except json.JSONDecodeError:
-                    st.error("Invalid JSON ABI provided. Please check the format.")
-                    st.session_state.model.contract_abi = None
-                st.session_state.blockchain_logs = [] # Initialize blockchain logs
-
                 st.session_state.compare_results = None
 
         with col_btn2:
@@ -773,7 +547,6 @@ def main():
                 if 'model' in st.session_state:
                     del st.session_state.model
                 st.session_state.compare_results = None
-                st.session_state.blockchain_logs = [] # Clear blockchain logs on reset
 
         with col_btn4:
             if st.button("💾 Export Data (Coming Soon)"):
@@ -798,8 +571,6 @@ def main():
         st.session_state.simulation_running = False
     if 'current_step' not in st.session_state:
         st.session_state.current_step = 0
-    if 'blockchain_logs' not in st.session_state: # Initialize blockchain logs if not present
-        st.session_state.blockchain_logs = []
 
     # Create model if not exists (or if reset)
     if 'model' not in st.session_state:
@@ -807,21 +578,12 @@ def main():
             grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
             selected_model, prompt_style
         )
-        # Apply pheromone settings from sidebar to the initial model (Pheromone Feature)
+        # Apply pheromone settings from sidebar to the initial model
         st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
         st.session_state.model.trail_deposit = trail_deposit
         st.session_state.model.alarm_deposit = alarm_deposit
         st.session_state.model.recruitment_deposit = recruitment_deposit
         st.session_state.model.max_pheromone_value = max_pheromone_value
-        
-        # Apply blockchain settings from sidebar to the initial model (Blockchain Feature)
-        st.session_state.model.contract_address = contract_address
-        try:
-            st.session_state.model.contract_abi = json.loads(contract_abi)
-        except json.JSONDecodeError:
-            st.error("Invalid JSON ABI provided. Please check the format.")
-            st.session_state.model.contract_abi = None
-
 
     model = st.session_state.model
 
@@ -829,7 +591,7 @@ def main():
     st.subheader("🗺️ Live Simulation Visualization")
     fig = go.Figure()
 
-    # Add the foraging efficiency heatmap as the first trace so it's in the background (Teammate's Feature)
+    # Add the foraging efficiency heatmap as the first trace so it's in the background
     efficiency_data = st.session_state.model.foraging_efficiency_grid
     fig.add_trace(go.Heatmap(
         z=efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
@@ -900,7 +662,7 @@ def main():
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # Pheromone Map Visualizations (Pheromone Feature)
+    # Pheromone Map Visualizations (from my previous version)
     st.subheader("🧪 Pheromone Maps")
     
     pheromone_cols = st.columns(3)
@@ -972,15 +734,6 @@ def main():
     else:
         st.info("Queen Overseer disabled")
 
-    # Blockchain Transaction Logs (New Feature)
-    if BLOCKCHAIN_ENABLED:
-        st.subheader("🔗 Blockchain Transaction Logs")
-        if st.session_state.blockchain_logs:
-            for log in reversed(st.session_state.blockchain_logs): # Show latest first
-                st.code(log)
-        else:
-            st.info("No blockchain transactions logged yet.")
-
     # Simulation execution
     if st.session_state.simulation_running and model.step_count < max_steps:
         if len(model.foods) > 0:
@@ -1025,6 +778,21 @@ def main():
                                         markers=True)
                 st.plotly_chart(fig_depletion, use_container_width=True)
 
+        # Teammate's commented out Foraging Efficiency Map visualization (kept commented)
+        #st.write("### 🌐 Foraging Efficiency Map (LLM Activity)")
+        #efficiency_data = st.session_state.model.foraging_efficiency_grid
+        #fig_efficiency = px.imshow(efficiency_data.T, # Transpose for correct orientation (x=cols, y=rows)
+        #                            color_continuous_scale="Hot", # Use a "hot" color scale
+        #                            labels=dict(x="X Position", y="Y Position", color="Efficiency Score"),
+        #                            title="LLM Foraging Activity Hotspot",
+        #                            origin="lower", # Important for correct Y-axis orientation
+        #                            range_color=[0, np.max(efficiency_data) * 1.2]) # Scale color range dynamically
+        #fig_efficiency.update_xaxes(side="top", showgrid=False, zeroline=False,
+        #                            tickvals=np.arange(model.width), ticktext=np.arange(model.width))
+        #fig_efficiency.update_yaxes(showgrid=False, zeroline=False,
+        #                            tickvals=np.arange(model.height), ticktext=np.arange(model.height))
+        #st.plotly_chart(fig_efficiency, use_container_width=True)
+
     # Comparison section
     st.markdown("---")
     st.subheader("📊 Comparison: Queen vs No-Queen")
@@ -1041,9 +809,7 @@ def main():
                 'trail_deposit': trail_deposit,
                 'alarm_deposit': alarm_deposit,
                 'recruitment_deposit': recruitment_deposit,
-                'max_pheromone_value': max_pheromone_value,
-                'contract_address': contract_address, # Pass blockchain params
-                'contract_abi': contract_abi
+                'max_pheromone_value': max_pheromone_value
             }
             food_no_queen = run_comparison_simulation(no_queen_params)
 
@@ -1088,8 +854,6 @@ def main():
         - Alarm Deposit: {alarm_deposit}
         - Recruitment Deposit: {recruitment_deposit}
         - Max Pheromone Value: {max_pheromone_value}
-
-        **Blockchain Integration Status:** {'Enabled' if BLOCKCHAIN_ENABLED else 'Disabled (Error)'}
 
         **Current Status:**
         - Step: {model.step_count}/{max_steps}
