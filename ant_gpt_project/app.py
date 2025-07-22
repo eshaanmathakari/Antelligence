@@ -153,9 +153,6 @@ class SimpleAntAgent:
             # --- Blockchain Integration: Log food collection (New Feature) ---
             if BLOCKCHAIN_ENABLED:
                 try:
-                    # Use MEMORY_CONTRACT_ADDRESS and its ABI for logging food collection
-                    # Ensure the ABI loaded into self.model.contract_abi is for ColonyMemory
-                    
                     # Convert the contract_address to its checksummed format
                     # Use MEMORY_CONTRACT_ADDRESS from blockchain.client
                     checksum_memory_contract_address = w3.to_checksum_address(MEMORY_CONTRACT_ADDRESS)
@@ -163,17 +160,23 @@ class SimpleAntAgent:
                     # Use the checksummed address and the correct ABI (which should be for ColonyMemory)
                     memory_contract = w3.eth.contract(address=checksum_memory_contract_address, abi=self.model.contract_abi)
 
+                    # --- FIX: Dynamically fetch nonce and gas price ---
                     # Get the nonce for the sending account (crucial for transaction ordering)
-                    nonce = w3.eth.get_transaction_count(acct.address)
+                    # Use 'pending' to account for transactions already sent but not yet mined
+                    nonce = w3.eth.get_transaction_count(acct.address, 'pending')
+
+                    # Get the current recommended gas price from the network
+                    gas_price = w3.eth.gas_price
+                    # --- END FIX ---
 
                     # Build the transaction dictionary, calling 'recordFood'
                     # Note: unique_id is uint256, pos[0] and pos[1] are uint32 in Solidity
-                    tx = memory_contract.functions.recordFood( # Changed from logFoodCollection to recordFood
+                    tx = memory_contract.functions.recordFood(
                         self.unique_id, self.pos[0], self.pos[1]
                     ).build_transaction({
                         'chainId': w3.eth.chain_id,
                         'gas': 200000, # A reasonable gas limit for a simple function call
-                        'gasPrice': w3.eth.gas_price, # Get current network gas price
+                        'gasPrice': gas_price, # Use the dynamically fetched gas price
                         'nonce': nonce,
                         'from': acct.address # This specifies the sender, but the signing happens locally
                     })
@@ -181,8 +184,19 @@ class SimpleAntAgent:
                     # Sign the transaction locally with the private key
                     signed_tx = w3.eth.account.sign_transaction(tx, acct.key)
 
+                    # --- DEBUGGING ADDITION (REMOVE AFTER FIX) ---
+                    # This block was for debugging and can be removed once the fix is confirmed
+                    # if not hasattr(signed_tx, 'rawTransaction'):
+                    #     st.session_state.blockchain_logs.append(f"DEBUG: signed_tx object MISSING 'rawTransaction' attribute.")
+                    #     st.session_state.blockchain_logs.append(f"DEBUG: Type of signed_tx: {type(signed_tx)}")
+                    #     st.session_state.blockchain_logs.append(f"DEBUG: Attributes of signed_tx: {dir(signed_tx)}")
+                    #     raise AttributeError("SignedTransaction object is missing 'rawTransaction' attribute.")
+                    # --- END DEBUGGING ADDITION ---
+
                     # Send the signed raw transaction to the network
+                    # --- FIX: Use raw_transaction (snake_case) instead of rawTransaction (camelCase) ---
                     tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    # --- END FIX ---
                     
                     st.session_state.blockchain_logs.append(f"Food collected by Ant {self.unique_id} at {self.pos}. Tx: {tx_hash.hex()}")
                 except Exception as b_e:
@@ -1054,7 +1068,7 @@ def main():
     st.plotly_chart(fig, use_container_width=True)
 
     # Pheromone Map Visualizations (Pheromone Feature)
-    st.subheader("� Pheromone Maps")
+    st.subheader("🧪 Pheromone Maps")
     
     pheromone_cols = st.columns(3)
 
