@@ -23,24 +23,24 @@ import matplotlib.pyplot as plt  # Now import pyplot after setting backend
 # Load environment variables
 load_dotenv()
 IO_API_KEY = os.getenv("IO_SECRET_KEY")
-
-# Page configuration
 st.set_page_config(
     page_title="IO-Powered Ant Foraging Simulation",
     page_icon="🐜",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# --- Blockchain Integration (from teammate's code) ---
+# --- Blockchain Integration ---
 try:
-    from blockchain.client import w3, acct, MEMORY_CONTRACT_ADDRESS  # Import MEMORY_CONTRACT_ADDRESS
+    from blockchain.client import w3, acct, MEMORY_CONTRACT_ADDRESS
     BLOCKCHAIN_ENABLED = True
     st.success("Blockchain client loaded successfully!")
 except Exception as e:
     BLOCKCHAIN_ENABLED = False
     st.warning(f"Blockchain client could not be loaded: {e}. Blockchain features will be disabled.")
 # --- End Blockchain Integration ---
+
+# Page configuration
+
 
 # Custom CSS
 st.markdown("""
@@ -87,14 +87,11 @@ class SimpleAntAgent:
 
         # Pheromone deposition before moving (based on current state)
         if self.carrying_food:
-            # Deposit trail pheromone when carrying food (implies returning from food source)
-            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 0.5)  # Less intense when returning
+            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 0.5)
         elif self.model.is_food_at(self.pos):
-            # Deposit trail pheromone when at a food source
-            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5)  # More intense at source
+            self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5)
 
         if guided_pos and guided_pos in possible_steps + [self.pos]:
-            # Queen guidance takes priority
             new_position = guided_pos
         elif self.is_llm_controlled and self.model.io_client:
             try:
@@ -102,52 +99,39 @@ class SimpleAntAgent:
                 self.api_calls += 1
                 if action == "toward" and possible_steps:
                     target_food = self._find_nearest_food()
-                    if target_food:
-                        new_position = self._step_toward(self.pos, target_food)
-                    else:
-                        new_position = choice(possible_steps)
+                    new_position = self._step_toward(self.pos, target_food) if target_food else choice(possible_steps)
                 elif action == "random" and possible_steps:
                     new_position = choice(possible_steps)
                 elif action == "stay":
                     new_position = self.pos
                 else:
                     new_position = choice(possible_steps) if possible_steps else self.pos
-            except Exception as e:
-                # Deposit alarm pheromone on API error
-                self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5)  # More intense alarm for API error
-                if possible_steps:
-                    new_position = choice(possible_steps)
-                else:
-                    new_position = self.pos
+            except Exception:
+                self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5)
+                new_position = choice(possible_steps) if possible_steps else self.pos
         else:
-            # Rule-based behavior
             if self.model.is_food_at(self.pos) and not self.carrying_food:
-                new_position = self.pos  # Stay to pick up food
+                new_position = self.pos
             elif self.carrying_food:
-                # Move towards nest/home (center of grid for simplicity)
                 home = (self.model.width // 2, self.model.height // 2)
                 new_position = self._step_toward(self.pos, home)
             else:
                 target_food = self._find_nearest_food()
-                if target_food:
-                    new_position = self._step_toward(self.pos, target_food)
-                else:
-                    new_position = choice(possible_steps) if possible_steps else self.pos
+                new_position = self._step_toward(self.pos, target_food) if target_food else (
+                    choice(possible_steps) if possible_steps else self.pos
+                )
 
         self.move_history.append(self.pos)
         self.pos = new_position
 
         # Food pickup/drop logic
         if self.model.is_food_at(self.pos) and not self.carrying_food:
-            # Pick up food
             self.carrying_food = True
             self.model.collect_food(self.pos, self.is_llm_controlled)
             self.food_collected_count += 1
-            self.steps_since_food = 0  # Reset counter
-            # Deposit a strong trail pheromone upon successful food pickup
+            self.steps_since_food = 0
             self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 2)
 
-            # --- Blockchain Integration: Log food collection (New Feature) ---
             if BLOCKCHAIN_ENABLED:
                 try:
                     checksum_memory_contract_address = w3.to_checksum_address(
@@ -175,30 +159,22 @@ class SimpleAntAgent:
                     )
                 except Exception as b_e:
                     st.session_state.blockchain_logs.append(f"Blockchain log failed for Ant {self.unique_id}: {b_e}")
-            # --- End Blockchain Integration ---
-
         else:
             self.steps_since_food += 1
-            # If LLM ant hasn't found food for a while, deposit recruitment pheromone
             if self.is_llm_controlled and self.steps_since_food > 10 and not self.carrying_food:
                 self.model.deposit_pheromone(self.pos, 'recruitment', self.model.recruitment_deposit)
 
-        # Only drop food at nest/home for rule-based ants, never randomly for LLM ants
         if self.carrying_food and not self.is_llm_controlled:
             home = (self.model.width // 2, self.model.height // 2)
-            # Drop food if at home position or very close to it
             if abs(self.pos[0] - home[0]) <= 1 and abs(self.pos[1] - home[1]) <= 1:
-                if random.random() < 0.3:  # 30% chance to drop at home
+                if random.random() < 0.3:
                     self.carrying_food = False
-                    # Don't place food back on grid when dropping at home
-                    # Deposit trail pheromone at nest when dropping food
                     self.model.deposit_pheromone(self.pos, 'trail', self.model.trail_deposit * 1.5)
 
     def _find_nearest_food(self):
         if not self.model.foods:
             return None
-        return min(self.model.foods,
-                   key=lambda f: abs(f[0]-self.pos[0]) + abs(f[1]-self.pos[1]))
+        return min(self.model.foods, key=lambda f: abs(f[0] - self.pos[0]) + abs(f[1] - self.pos[1]))
 
     def _step_toward(self, start, target):
         x, y = start
@@ -206,7 +182,7 @@ class SimpleAntAgent:
         possible_moves = self.model.get_neighborhood(x, y)
         if not possible_moves:
             return start
-        return min(possible_moves, key=lambda n: abs(n[0]-tx)+abs(n[1]-ty))
+        return min(possible_moves, key=lambda n: abs(n[0] - tx) + abs(n[1] - ty))
 
     def ask_io_for_decision(self, prompt_style_param, selected_model_param):
         x, y = self.pos
@@ -215,9 +191,7 @@ class SimpleAntAgent:
             for fx, fy in self.model.get_food_positions()
         )
 
-        # Get local pheromone information
         local_pheromones = self.model.get_local_pheromones(self.pos, radius=2)
-
         pheromone_info = (
             f"Local Pheromones (radius 2): "
             f"Trail: {local_pheromones['trail']:.2f}, "
@@ -225,7 +199,6 @@ class SimpleAntAgent:
             f"Recruitment: {local_pheromones['recruitment']:.2f}. "
         )
 
-        # PREDATOR AWARENESS IN PROMPT
         predator_info = ""
         if self.model.predator:
             px, py = self.model.predator.pos
@@ -237,7 +210,6 @@ class SimpleAntAgent:
                 predator_info = "No immediate predator threat. "
         else:
             predator_info = "No predators detected in the environment. "
-        # END
 
         if prompt_style_param == "Structured":
             prompt = (
@@ -282,9 +254,8 @@ class SimpleAntAgent:
             )
             action = response.choices[0].message.content.strip().lower()
             return action if action in ["toward", "random", "stay"] else "random"
-        except Exception as e:
-            # Deposit alarm pheromone on API error
-            self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5)  # More intense alarm for API error
+        except Exception:
+            self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5)
             return "random"
 
 
@@ -307,7 +278,7 @@ class PredatorAgent:
         if possible_steps:
             self.pos = random.choice(possible_steps)
         else:
-            self.pos = (x, y)  # Stay in place if no moves possible
+            self.pos = (x, y)
 # PredatorAgent Class
 
 
@@ -319,7 +290,6 @@ class SimpleForagingModel:
         self.height = height
         self.foods = set()
 
-        # Generate unique food positions
         while len(self.foods) < N_food:
             new_food_pos = (np.random.randint(width), np.random.randint(height))
             self.foods.add(new_food_pos)
@@ -338,19 +308,17 @@ class SimpleForagingModel:
         self.selected_model = selected_model_param
         self.prompt_style = prompt_style_param
 
-        # Pheromone map initialization
         self.pheromone_map = {
             'trail': np.zeros((width, height)),
             'alarm': np.zeros((width, height)),
             'recruitment': np.zeros((width, height))
         }
-        self.pheromone_decay_rate = 0.05  # 5% decay per step
+        self.pheromone_decay_rate = 0.05
         self.trail_deposit = 1.0
         self.alarm_deposit = 2.0
         self.recruitment_deposit = 1.5
-        self.max_pheromone_value = 10.0  # Upper bound for pheromone values
+        self.max_pheromone_value = 10.0
 
-        # Initialize IO client
         if IO_API_KEY:
             self.io_client = openai.OpenAI(
                 api_key=IO_API_KEY,
@@ -363,29 +331,22 @@ class SimpleForagingModel:
         self.food_depletion_history = []
         self.initial_food_count = N_food
 
-        # --- FORAGING EFFICIENCY MAP ---
         self.foraging_efficiency_grid = np.zeros((self.width, self.height))
-        self.foraging_decay_rate = 0.98  # Retains 98% of value each step, 2% decays
+        self.foraging_decay_rate = 0.98
         self.food_collection_score_boost = 10.0
         self.traverse_score_boost = 0.1
-        # --- END ADDITION ---
 
-        # --- Blockchain Contract Details (New Feature) ---
         self.contract_address = None
         self.contract_abi = None
-        # --- End Blockchain Contract Details ---
 
-        # PREDATOR initialisation
         self.predator = None
-        # END
 
-        # Create agents based on type
         self.ants = []
         if agent_type == "LLM-Powered":
             self.ants = [SimpleAntAgent(i, self, True) for i in range(N_ants)]
         elif agent_type == "Rule-Based":
             self.ants = [SimpleAntAgent(i, self, False) for i in range(N_ants)]
-        else:  # Hybrid
+        else:
             for i in range(N_ants):
                 is_llm = i < N_ants // 2
                 self.ants.append(SimpleAntAgent(i, self, is_llm))
@@ -405,19 +366,16 @@ class SimpleForagingModel:
 
         self.metrics["ants_carrying_food"] = 0
         for ant in self.ants:
-            guided_pos = guidance.get(ant.unique_id)  # Use ant ID as key
+            guided_pos = guidance.get(ant.unique_id)
             ant.step(guided_pos)
             if ant.carrying_food:
                 self.metrics["ants_carrying_food"] += 1
             if ant.is_llm_controlled:
                 self.metrics["total_api_calls"] += ant.api_calls
 
-        # PREDATOR- moving the predator around
         if self.predator:
             self.predator.step()
-        # END
 
-        # --- FORAGING EFFICIENCY MAP updates ---
         self.foraging_efficiency_grid *= self.foraging_decay_rate
         self.foraging_efficiency_grid[self.foraging_efficiency_grid < 0.01] = 0
 
@@ -426,9 +384,7 @@ class SimpleForagingModel:
                 x, y = ant.pos
                 if 0 <= x < self.width and 0 <= y < self.height:
                     self.foraging_efficiency_grid[x, y] += self.traverse_score_boost
-        # --- END ADDITION ---
 
-        # Apply pheromone evaporation and clipping after all ants have moved
         for p_type in self.pheromone_map:
             self.pheromone_map[p_type] *= (1 - self.pheromone_decay_rate)
             self.pheromone_map[p_type] = np.clip(self.pheromone_map[p_type], 0, self.max_pheromone_value)
@@ -440,15 +396,8 @@ class SimpleForagingModel:
         })
 
     def get_neighborhood(self, x, y):
-        neigh = [(x+dx, y+dy)
-                 for dx in (-1,0,1)
-                 for dy in (-1,0,1)
-                 if (dx,dy)!=(0,0)]
-        valid_neigh = []
-        for i,j in neigh:
-            if 0 <= i < self.width and 0 <= j < self.height:
-                valid_neigh.append((i,j))
-        return valid_neigh
+        neigh = [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
+        return [(i, j) for i, j in neigh if 0 <= i < self.width and 0 <= j < self.height]
 
     def is_food_at(self, pos):
         return pos in self.foods
@@ -457,12 +406,10 @@ class SimpleForagingModel:
         if pos in self.foods:
             self.foods.discard(pos)
             self.metrics["food_collected"] += 1
-
             if is_llm_controlled_ant:
                 self.metrics["food_collected_by_llm"] += 1
             else:
                 self.metrics["food_collected_by_rule"] += 1
-
             x, y = pos
             if 0 <= x < self.width and 0 <= y < self.height and is_llm_controlled_ant:
                 self.foraging_efficiency_grid[x, y] += self.food_collection_score_boost
@@ -480,7 +427,9 @@ class SimpleForagingModel:
     def deposit_pheromone(self, pos, p_type, amount):
         if 0 <= pos[0] < self.width and 0 <= pos[1] < self.height:
             self.pheromone_map[p_type][pos[0], pos[1]] += amount
-            self.pheromone_map[p_type][pos[0], pos[1]] = min(self.pheromone_map[p_type][pos[0], pos[1]], self.max_pheromone_value)
+            self.pheromone_map[p_type][pos[0], pos[1]] = min(
+                self.pheromone_map[p_type][pos[0], pos[1]], self.max_pheromone_value
+            )
 
     def get_local_pheromones(self, pos, radius):
         x, y = pos
@@ -496,14 +445,13 @@ class SimpleForagingModel:
                     local_alarm += self.pheromone_map['alarm'][nx, ny]
                     local_recruitment += self.pheromone_map['recruitment'][nx, ny]
 
-        area = (2 * radius + 1)**2
+        area = (2 * radius + 1) ** 2
         return {
             'trail': local_trail / area,
             'alarm': local_alarm / area,
             'recruitment': local_recruitment / area
         }
 
-    # PREDATOR Control Methods (SUMMON OR DISMISS) ---
     def summon_predator(self):
         if self.predator is None:
             self.predator = PredatorAgent(self)
@@ -511,7 +459,6 @@ class SimpleForagingModel:
     def dismiss_predator(self):
         if self.predator is not None:
             self.predator = None
-    # END
 
 
 class QueenAnt:
@@ -539,13 +486,13 @@ class QueenAnt:
             if foods:
                 target = min(
                     foods,
-                    key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1])
+                    key=lambda f: abs(f[0] - ant.pos[0]) + abs(f[1] - ant.pos[1])
                 )
                 possible_moves = self.model.get_neighborhood(*ant.pos) + [ant.pos]
                 if possible_moves:
                     best_step = min(
                         possible_moves,
-                        key=lambda n: abs(n[0]-target[0]) + abs(n[1]-target[1])
+                        key=lambda n: abs(n[0] - target[0]) + abs(n[1] - target[1])
                     )
                     guidance[ant.unique_id] = best_step
 
@@ -592,7 +539,7 @@ Ant positions and nearby food:
 """
 
         for ant in self.model.ants[:5]:
-            nearby_food = [f for f in self.model.foods if abs(f[0]-ant.pos[0]) <= 2 and abs(f[1]-ant.pos[1]) <= 2]
+            nearby_food = [f for f in self.model.foods if abs(f[0] - ant.pos[0]) <= 2 and abs(f[1] - ant.pos[1]) <= 2]
             prompt += f"Ant {ant.unique_id}: at {ant.pos}, carrying={ant.carrying_food}, nearby_food={len(nearby_food)}\n"
 
         try:
@@ -688,7 +635,7 @@ with st.sidebar.expander("✨ Pheromone Settings", expanded=True):
     recruitment_deposit = st.slider("Recruitment Pheromone Deposit", 0.1, 5.0, 1.5, 0.1)
     max_pheromone_value = st.slider("Max Pheromone Value", 5.0, 20.0, 10.0, 0.5)
 
-# --- Blockchain Settings (New Feature) ---
+# --- Blockchain Settings ---
 if BLOCKCHAIN_ENABLED:
     with st.sidebar.expander("🔗 Blockchain Settings", expanded=True):
         st.info("Ensure your local blockchain node is running and PRIVATE_KEY is set in .env")
@@ -803,14 +750,12 @@ def run_comparison_simulation(params, num_steps_for_comparison=100):
         selected_model_param=params['selected_model'],
         prompt_style_param=params['prompt_style']
     )
-    # Apply pheromone settings for comparison run
     model.pheromone_decay_rate = params['pheromone_decay_rate']
     model.trail_deposit = params['trail_deposit']
     model.alarm_deposit = params['alarm_deposit']
     model.recruitment_deposit = params['recruitment_deposit']
     model.max_pheromone_value = params['max_pheromone_value']
 
-    # Apply blockchain settings for comparison run
     model.contract_address = params['contract_address']
     model.contract_abi = json.loads(params['contract_abi']) if params['contract_abi'] else None
 
@@ -836,21 +781,19 @@ def main():
                     grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
                     selected_model, prompt_style
                 )
-                # Apply pheromone settings from sidebar to the live model
                 st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
                 st.session_state.model.trail_deposit = trail_deposit
                 st.session_state.model.alarm_deposit = alarm_deposit
                 st.session_state.model.recruitment_deposit = recruitment_deposit
                 st.session_state.model.max_pheromone_value = max_pheromone_value
 
-                # Apply blockchain settings to the live model
                 st.session_state.model.contract_address = contract_address
                 try:
                     st.session_state.model.contract_abi = json.loads(contract_abi) if contract_abi else None
                 except json.JSONDecodeError:
                     st.error("Invalid JSON ABI provided. Please check the format.")
                     st.session_state.model.contract_abi = None
-                st.session_state.blockchain_logs = []  # Initialize blockchain logs
+                st.session_state.blockchain_logs = []
 
                 st.session_state.compare_results = None
 
@@ -885,7 +828,6 @@ def main():
                 st.metric("Active Ants", len(model.ants))
                 st.metric("Food Left", len(model.foods))
 
-    # Initialize simulation state
     if 'simulation_running' not in st.session_state:
         st.session_state.simulation_running = False
     if 'current_step' not in st.session_state:
@@ -893,20 +835,17 @@ def main():
     if 'blockchain_logs' not in st.session_state:
         st.session_state.blockchain_logs = []
 
-    # Create model if not exists (or if reset)
     if 'model' not in st.session_state:
         st.session_state.model = SimpleForagingModel(
             grid_width, grid_height, n_ants, n_food, agent_type, use_queen, use_llm_queen,
             selected_model, prompt_style
         )
-        # Apply pheromone settings from sidebar to the initial model
         st.session_state.model.pheromone_decay_rate = pheromone_decay_rate
         st.session_state.model.trail_deposit = trail_deposit
         st.session_state.model.alarm_deposit = alarm_deposit
         st.session_state.model.recruitment_deposit = recruitment_deposit
         st.session_state.model.max_pheromone_value = max_pheromone_value
 
-        # Apply blockchain settings from sidebar to the initial model
         st.session_state.model.contract_address = contract_address
         try:
             st.session_state.model.contract_abi = json.loads(contract_abi) if contract_abi else None
@@ -916,11 +855,9 @@ def main():
 
     model = st.session_state.model
 
-    # Main visualization
     st.subheader("🗺️ Live Simulation Visualization")
     fig = go.Figure()
 
-    # Add the foraging efficiency heatmap as the first trace so it's in the background
     efficiency_data = st.session_state.model.foraging_efficiency_grid
     fig.add_trace(go.Heatmap(
         z=efficiency_data.T,
@@ -935,7 +872,6 @@ def main():
         zmax=np.max(efficiency_data) * 1.2 if np.max(efficiency_data) > 0 else 1
     ))
 
-    # Add food items
     if model.foods:
         food_x, food_y = zip(*model.foods)
         fig.add_trace(go.Scatter(
@@ -946,7 +882,6 @@ def main():
             hovertemplate='Food at (%{x}, %{y})<extra></extra>'
         ))
 
-    # PREDATOR VISUALIZATION
     if model.predator:
         px_pred, py_pred = model.predator.pos
         fig.add_trace(go.Scatter(
@@ -957,9 +892,7 @@ def main():
             name='Predator',
             hovertemplate='Predator at (%{x}, %{y})<extra></extra>'
         ))
-    # END
 
-    # Add ants
     if model.ants:
         ant_x, ant_y = zip(*[ant.pos for ant in model.ants])
         colors = ['red' if ant.carrying_food else ('orange' if ant.is_llm_controlled else 'blue') for ant in model.ants]
@@ -975,7 +908,6 @@ def main():
             hovertemplate='%{text}<br>Position: (%{x}, %{y})<br>Carrying Food: %{marker.color}'
         ))
 
-    # Add home/nest marker
     home_x, home_y = grid_width // 2, grid_height // 2
     fig.add_trace(go.Scatter(
         x=[home_x], y=[home_y],
@@ -985,7 +917,6 @@ def main():
         hovertemplate='Nest at (%{x}, %{y})<extra></extra>'
     ))
 
-    # Configure layout
     fig.update_layout(
         title=f"Ant Foraging Simulation - Step {model.step_count}",
         xaxis=dict(range=[-1, grid_width], title="X Position",
@@ -1003,7 +934,6 @@ def main():
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # PREDATOR: Summon/Dismiss Predator Controls
     st.markdown("---")
     st.subheader("👹 Dynamic Challenges")
 
@@ -1018,14 +948,11 @@ def main():
         if st.button("Dismiss Predator ✨", type="secondary", disabled=model.predator is None):
             model.dismiss_predator()
             st.rerun()
-    # END NEW CONTROLS
 
-    # Pheromone Map Visualizations
     st.subheader("🧪 Pheromone Maps")
 
     pheromone_cols = st.columns(3)
 
-    # Trail Pheromone Heatmap
     with pheromone_cols[0]:
         st.markdown("##### Trail Pheromone")
         fig_trail = go.Figure(data=go.Heatmap(
@@ -1042,7 +969,6 @@ def main():
         )
         st.plotly_chart(fig_trail, use_container_width=True)
 
-    # Alarm Pheromone Heatmap
     with pheromone_cols[1]:
         st.markdown("##### Alarm Pheromone")
         fig_alarm = go.Figure(data=go.Heatmap(
@@ -1059,7 +985,6 @@ def main():
         )
         st.plotly_chart(fig_alarm, use_container_width=True)
 
-    # Recruitment Pheromone Heatmap
     with pheromone_cols[2]:
         st.markdown("##### Recruitment Pheromone")
         fig_recruitment = go.Figure(data=go.Heatmap(
@@ -1076,7 +1001,6 @@ def main():
         )
         st.plotly_chart(fig_recruitment, use_container_width=True)
 
-    # Queen's Report Section
     st.subheader("👑 Queen's Anomaly Report")
     if model.queen and model.use_llm_queen:
         report = model.queen_llm_anomaly_rep
@@ -1091,7 +1015,6 @@ def main():
     else:
         st.info("Queen Overseer disabled")
 
-    # Blockchain Transaction Logs
     if BLOCKCHAIN_ENABLED:
         st.subheader("🔗 Blockchain Transaction Logs")
         if st.session_state.blockchain_logs:
@@ -1100,7 +1023,6 @@ def main():
         else:
             st.info("No blockchain transactions logged yet.")
 
-    # Simulation execution
     if st.session_state.simulation_running and model.step_count < max_steps:
         if len(model.foods) > 0:
             with st.spinner(f"Running step {model.step_count + 1}..."):
@@ -1112,7 +1034,6 @@ def main():
             st.session_state.simulation_running = False
             st.rerun()
 
-    # Performance analysis
     if model.step_count > 0:
         st.subheader("📈 Performance Analysis")
         col_p1, col_p2 = st.columns(2)
