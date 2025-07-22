@@ -187,3 +187,34 @@ cython_debug/
 *.png 
 *.gif
 
+# Node.js modules and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Hardhat build artifacts
+artifacts/
+cache/
+typechain/
+coverage/
+coverage.json
+
+# Environment variables
+.env
+.env.*          # any variant like .env.local or .env.development
+
+# Compiled contract ABI outputs
+*.tsbuildinfo
+
+# Hardhat watch mode files
+watcher/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Optional IDE/workspace folders
+.vscode/
+.idea/
+*.swp

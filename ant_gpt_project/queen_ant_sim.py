@@ -7,9 +7,10 @@ Run two ant-foraging simulations on the same grid:
 After 10 ticks we compare how many food pellets are left.
 """
 
-import random, math
+import random
+import math
 import matplotlib
-matplotlib.use("MacOSX")   # <-- for macOS interactive plots, fixes the _Stack bug
+matplotlib.use("Agg")  # cross‑platform backend
 import matplotlib.pyplot as plt
 
 # ----------------------  core agent types ---------------------- #
@@ -46,8 +47,10 @@ class QueenAnt:
         if not self.model.foods:
             return guidance
         for ant in self.model.ants:
-            target = min(self.model.foods,
-                         key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1]))
+            target = min(
+                self.model.foods,
+                key=lambda f: abs(f[0]-ant.pos[0]) + abs(f[1]-ant.pos[1])
+            )
             guidance[ant] = _step_toward(ant.pos, target, self.model)
         return guidance
 
@@ -67,10 +70,12 @@ class ForagingModel:
                 return (x, y)
 
     def neighborhood(self, x, y):
-        neigh = [(x+dx, y+dy)
-                 for dx in (-1,0,1)
-                 for dy in (-1,0,1)
-                 if (dx,dy)!=(0,0)]
+        neigh = [
+            (x+dx, y+dy)
+            for dx in (-1,0,1)
+            for dy in (-1,0,1)
+            if (dx,dy)!=(0,0)
+        ]
         return [(i%self.w, j%self.h) for i,j in neigh]
 
     def step(self):
@@ -82,7 +87,10 @@ class ForagingModel:
 def _step_toward(start, target, model):
     x, y = start
     tx, ty = target
-    return min(model.neighborhood(x,y), key=lambda n: abs(n[0]-tx)+abs(n[1]-ty))
+    return min(
+        model.neighborhood(x, y),
+        key=lambda n: abs(n[0]-tx) + abs(n[1]-ty)
+    )
 
 # ----------------------  experiment ---------------------- #
 def run_sim(use_queen=False):
@@ -100,7 +108,7 @@ def compare():
     print(f"  • Without queen : food left = {left_no_q}")
     print(f"  • With queen    : food left = {left_q}")
 
-    plt.bar(["No Queen","With Queen"], [left_no_q, left_q])
+    plt.bar(["No Queen", "With Queen"], [left_no_q, left_q])
     plt.ylabel("Food remaining (lower is better)")
     plt.title("Effect of Queen Guidance on Foraging Efficiency")
     plt.show()

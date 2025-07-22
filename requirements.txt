@@ -1,11 +1,22 @@
-streamlit
-numpy
-matplotlib==3.8.0 # This specific version is known to be stable with Python 3.11 for many users
-plotly
-Pillow
-python-dotenv
-openai
-imageio
-imageio-ffmpeg
+# Core AI & simulation
+numpy>=1.24
+matplotlib
+streamlit>=1.32
 pandas
-io-intelligence>=0.3.0
+
+# Async OpenAI-compatible client (for IO.net API)
+openai>=1.30.0
+
+# Web3 for blockchain interaction
+web3>=6.12.0
+eth-account>=0.10.0
+
+# Environment variable loader
+python-dotenv>=1.0.1
+
+# Dev and utils
+asyncio
+tqdm
+
+# Optional but helpful for visualization or image logging
+Pillow
