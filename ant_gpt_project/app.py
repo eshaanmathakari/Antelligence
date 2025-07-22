@@ -184,6 +184,22 @@ class SimpleAntAgent:
             f"Recruitment: {local_pheromones['recruitment']:.2f}. "
         )
 
+        # PREDATOR AWARENESS IN PROMPT 
+        predator_info = ""
+        if self.model.predator:
+            px, py = self.model.predator.pos
+            dist_to_predator = abs(px - x) + abs(py - y)
+            if dist_to_predator <= 5: # Ants can sense predator within 5 steps
+                predator_info = f"There is a predator nearby at ({px},{py}), {dist_to_predator} steps away. It poses a threat. "
+                # Ants might also drop alarm pheromone here if they sense it
+                # Deposit alarm pheromone, amount scales with proximity (closer = more alarm)
+                self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * (1.0 - (dist_to_predator / 5.0)))
+            else:
+                predator_info = "No immediate predator threat. "
+        else:
+            predator_info = "No predators detected in the environment. "
+        # END 
+
         if prompt_style_param == "Structured":
             prompt = (
                 f"You are an ant at position ({x},{y}) on a {self.model.width}x{self.model.height} grid. "
@@ -231,6 +247,29 @@ class SimpleAntAgent:
             # Deposit alarm pheromone on API error
             self.model.deposit_pheromone(self.pos, 'alarm', self.model.alarm_deposit * 1.5) # More intense alarm for API error
             return "random"
+
+
+# PREDATOR AGENT Class 
+class PredatorAgent:
+    def __init__(self, model):
+        self.model = model
+        # Start predator at a random edge or corner of the grid
+        edge = random.choice(['top', 'bottom', 'left', 'right'])
+        if edge == 'top': self.pos = (random.randint(0, model.width - 1), 0)
+        elif edge == 'bottom': self.pos = (random.randint(0, model.width - 1), model.height - 1)
+        elif edge == 'left': self.pos = (0, random.randint(0, model.height - 1))
+        else: self.pos = (model.width - 1, random.randint(0, model.height - 1))
+
+    def step(self):
+        # Predator moves randomly to an adjacent cell
+        x, y = self.pos
+        possible_steps = self.model.get_neighborhood(x, y)
+        if possible_steps:
+            self.pos = random.choice(possible_steps)
+        else:
+            self.pos = (x, y) # Stay in place if no moves possible
+# PredatorAgent Class
+
 
 class SimpleForagingModel:
     def __init__(self, width, height, N_ants, N_food,
@@ -293,6 +332,9 @@ class SimpleForagingModel:
         self.traverse_score_boost = 0.1 # Score boost for just traversing a cell
         # --- END ADDITION ---
 
+        # PREDATOR initialisation
+        self.predator = None # Initialize with no predator
+        # END 
 
         # Create agents based on type
         self.ants = []
@@ -327,6 +369,11 @@ class SimpleForagingModel:
             if ant.is_llm_controlled:
                 self.metrics["total_api_calls"] += ant.api_calls
 
+
+        # PREDATOR- moving the predator around
+        if self.predator:
+            self.predator.step() # Move the predator
+        # END 
 
         # --- FORAGING EFFICIENCY MAP updates (from teammate's code) ---
         # 1. Apply decay to the entire grid at the beginning of this update phase
@@ -429,6 +476,19 @@ class SimpleForagingModel:
             'alarm': local_alarm / area,
             'recruitment': local_recruitment / area
         }
+    
+     # PREDATOR Control Methods (SUMMON OR DISMISS) ---
+    def summon_predator(self):
+        if self.predator is None: # Only summon if no predator exists
+            self.predator = PredatorAgent(self)
+            # st.success("A predator has appeared! 🕷️") # Streamlit message, will be added in main()
+                                                      # Keep this commented here if you're putting it in main() button logic
+    def dismiss_predator(self):
+        if self.predator is not None: # Only dismiss if a predator exists
+            self.predator = None
+            # st.info("The predator has vanished. The colony is safe... for now.") # Streamlit message
+                                                                                # Keep this commented here if you're putting it in main() button logic
+    # END
 
 # Queen agent class
 class QueenAnt:
@@ -735,6 +795,27 @@ def main():
     st.subheader("🗺️ Live Simulation Visualization")
     fig = go.Figure()
 
+    # PHEROMONE HEATMAP (Trail Pheromone)
+    
+    if 'trail' in model.pheromone_map and model.pheromone_map['trail'] is not None:
+        pheromone_data_for_display = model.pheromone_map['trail']
+
+        fig.add_trace(go.Heatmap(
+            z=pheromone_data_for_display.T, # Transpose for correct orientation
+            x=np.arange(model.width),
+            y=np.arange(model.height),
+            colorscale='Greens', 
+            colorbar=dict(title='Trail Pheromone'),
+            opacity=0.4, # Adjust for visibility
+            hoverinfo='skip', # Skip hover for heatmap cells
+            name='Pheromone Trails',
+            zmin=0,
+            zmax=model.max_pheromone_value # Use the max_pheromone_value from settings
+        ))
+    # --- Pheromone heatmap ---
+
+
+
     # Add the foraging efficiency heatmap as the first trace so it's in the background
     efficiency_data = st.session_state.model.foraging_efficiency_grid
     fig.add_trace(go.Heatmap(
@@ -761,6 +842,21 @@ def main():
             name='Food',
             hovertemplate='Food at (%{x}, %{y})<extra></extra>'
         ))
+
+    
+     # PREDATOR VISUALIZATION 
+    if model.predator:
+        px, py = model.predator.pos
+        fig.add_trace(go.Scatter(
+            x=[px], y=[py],
+            mode='markers',
+            marker=dict(color='black', size=20, symbol='diamond-open', # Black diamond with red outline
+                        line=dict(width=2, color='darkred')),
+            name='Predator',
+            hovertemplate='Predator at (%{x}, %{y})<extra></extra>'
+        ))
+    # END
+
 
     # Add ants
     if model.ants:
@@ -805,6 +901,26 @@ def main():
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgrey')
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # PREDATOR: Summon/Dismiss Predator Controls 
+    st.markdown("---")
+    st.subheader("👹 Dynamic Challenges")
+    
+    col_predator1, col_predator2 = st.columns(2)
+
+    with col_predator1:
+        # Summon button is enabled only if no predator exists
+        if st.button("Summon Predator 🕷️", type="secondary", disabled=model.predator is not None):
+            model.summon_predator()
+            st.rerun() # Force a rerun to update the display immediately
+            
+    with col_predator2:
+        # Dismiss button is enabled only if a predator exists
+        if st.button("Dismiss Predator ✨", type="secondary", disabled=model.predator is None):
+            model.dismiss_predator()
+            st.rerun() # Force a rerun to update the display immediately
+            
+    # END NEW CONTROLS 
 
     # Pheromone Map Visualizations (from my previous version)
     st.subheader("🧪 Pheromone Maps")
