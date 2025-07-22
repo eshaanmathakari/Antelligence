@@ -182,7 +182,7 @@ class SimpleAntAgent:
                     signed_tx = w3.eth.account.sign_transaction(tx, acct.key)
 
                     # Send the signed raw transaction to the network
-                    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                     
                     st.session_state.blockchain_logs.append(f"Food collected by Ant {self.unique_id} at {self.pos}. Tx: {tx_hash.hex()}")
                 except Exception as b_e:
